@@ -115,6 +115,8 @@ func getLabels(record events.S3EventRecord) (map[string]string, error) {
 
 func processS3Event(ctx context.Context, ev *events.S3Event) error {
 
+	fmt.Println("processing new S3Event\n")
+
 	batch, _ := newBatch(ctx)
 
 	for _, record := range ev.Records {
@@ -122,6 +124,7 @@ func processS3Event(ctx context.Context, ev *events.S3Event) error {
 		if err != nil {
 			return err
 		}
+		fmt.Println("processing S3Record with key: %s bucket: %s", labels["key"], labels["bucket"])
 
 		obj, err := getS3Object(ctx, labels)
 		if err != nil {
@@ -135,6 +138,7 @@ func processS3Event(ctx context.Context, ev *events.S3Event) error {
 
 	}
 
+	fmt.Println("sending S3Event to promtail\n")
 	err := sendToPromtail(ctx, batch)
 	if err != nil {
 		return err
