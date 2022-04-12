@@ -5,11 +5,12 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"github.com/prometheus/common/model"
 	"net/url"
 	"os"
 	"strconv"
 	"strings"
+
+	"github.com/prometheus/common/model"
 
 	"github.com/aws/aws-lambda-go/events"
 	"github.com/aws/aws-lambda-go/lambda"
@@ -128,6 +129,9 @@ func checkEventType(ev map[string]interface{}) (interface{}, error) {
 }
 
 func handler(ctx context.Context, ev map[string]interface{}) error {
+
+	fmt.Println("processing new event: ", ev)
+
 	event, err := checkEventType(ev)
 	if err != nil {
 		fmt.Printf("invalid event: %s\n", ev)

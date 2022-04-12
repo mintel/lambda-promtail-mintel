@@ -41,6 +41,9 @@ func parseCWEvent(ctx context.Context, b *batch, ev *events.CloudwatchLogsEvent)
 }
 
 func processCWEvent(ctx context.Context, ev *events.CloudwatchLogsEvent) error {
+
+	fmt.Println("processing new CWEvent")
+
 	batch, _ := newBatch(ctx)
 
 	err := parseCWEvent(ctx, batch, ev)
