@@ -124,7 +124,7 @@ func processS3Event(ctx context.Context, ev *events.S3Event) error {
 		if err != nil {
 			return err
 		}
-		fmt.Println("processing S3Record with key: %s bucket: %s", labels["key"], labels["bucket"])
+		fmt.Printf("processing S3Record with key: %s bucket: %s\n", labels["key"], labels["bucket"])
 
 		obj, err := getS3Object(ctx, labels)
 		if err != nil {
