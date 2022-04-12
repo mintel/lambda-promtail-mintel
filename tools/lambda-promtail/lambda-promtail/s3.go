@@ -138,7 +138,7 @@ func processS3Event(ctx context.Context, ev *events.S3Event) error {
 
 	}
 
-	fmt.Println("sending S3Event to promtail\n")
+	fmt.Println("sending S3Event to promtail")
 	err := sendToPromtail(ctx, batch)
 	if err != nil {
 		return err
