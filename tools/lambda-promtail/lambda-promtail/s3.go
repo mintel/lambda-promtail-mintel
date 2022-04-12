@@ -115,7 +115,7 @@ func getLabels(record events.S3EventRecord) (map[string]string, error) {
 
 func processS3Event(ctx context.Context, ev *events.S3Event) error {
 
-	fmt.Println("processing new S3Event\n")
+	fmt.Println("processing new S3Event")
 
 	batch, _ := newBatch(ctx)
 
