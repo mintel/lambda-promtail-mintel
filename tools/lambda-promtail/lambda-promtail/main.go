@@ -130,8 +130,6 @@ func checkEventType(ev map[string]interface{}) (interface{}, error) {
 
 func handler(ctx context.Context, ev map[string]interface{}) error {
 
-	fmt.Println("processing new event: ", ev)
-
 	event, err := checkEventType(ev)
 	if err != nil {
 		fmt.Printf("invalid event: %s\n", ev)
