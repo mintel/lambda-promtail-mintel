@@ -35,11 +35,20 @@ var (
 
 	// the indexes of the fields in the log that we want to create labels for
 	typeIndex              = loadBalancerLogLineRegex.SubexpIndex("type")
-	clientPortIndex        = loadBalancerLogLineRegex.SubexpIndex("client_port")
 	targetPortIndex        = loadBalancerLogLineRegex.SubexpIndex("target_port")
+	requestUrlIndex        = loadBalancerLogLineRegex.SubexpIndex("request_url")
 	elbStatusCodeIndex     = loadBalancerLogLineRegex.SubexpIndex("elb_status_code")
 	targetStatusCodeIndex  = loadBalancerLogLineRegex.SubexpIndex("target_status_code")
 	lambdaErrorReasonIndex = loadBalancerLogLineRegex.SubexpIndex("lambda_error_reason")
+
+	// regex that matches the endpoint of a request url in a load balancer log line
+	// format:  protocol://host:port/uri
+	// example: https://omni-web.svc.us-dev1.dev.mintel.cloud:443/internal/sso/retrieveAccessRights
+	// result:  retrieveAccessRights
+	requestUrlEndpointRegex = regexp.MustCompile(`([^0-9/]*$)`)
+
+	// don't push load balancer logs with traffic to these endpoints to loki
+	skipEndpoints = map[string]struct{}{"external-health-check": {}, "healthz": {}, "readiness": {}, "healthy": {}}
 )
 
 func getS3Object(ctx context.Context, labels map[string]string) (io.ReadCloser, error) {
@@ -98,19 +107,23 @@ func parseS3Log(ctx context.Context, b *batch, labels map[string]string, obj io.
 			return err
 		}
 
-		logLineLabelSet := model.LabelSet{
-			model.LabelName("log_lb_type"):                model.LabelValue(logLineMatch[typeIndex]),
-			model.LabelName("log_lb_client_port"):         model.LabelValue(logLineMatch[clientPortIndex]),
-			model.LabelName("log_lb_target_port"):         model.LabelValue(logLineMatch[targetPortIndex]),
-			model.LabelName("log_lb_elb_status_code"):     model.LabelValue(logLineMatch[elbStatusCodeIndex]),
-			model.LabelName("log_lb_target_status_code"):  model.LabelValue(logLineMatch[targetStatusCodeIndex]),
-			model.LabelName("log_lb_lambda_error_reason"): model.LabelValue(logLineMatch[lambdaErrorReasonIndex]),
-		}
+		targetEndpoint := requestUrlEndpointRegex.FindStringSubmatch(logLineMatch[requestUrlIndex])[1]
 
-		b.add(ctx, entry{ls.Merge(logLineLabelSet), logproto.Entry{
-			Line:      log_line,
-			Timestamp: timestamp,
-		}})
+		if _, skip := skipEndpoints[targetEndpoint]; !skip {
+			logLineLabelSet := model.LabelSet{
+				model.LabelName("lb_type"):                model.LabelValue(logLineMatch[typeIndex]),
+				model.LabelName("lb_target_port"):         model.LabelValue(logLineMatch[targetPortIndex]),
+				model.LabelName("lb_target_endpoint"):     model.LabelValue(targetEndpoint),
+				model.LabelName("lb_elb_status_code"):     model.LabelValue(logLineMatch[elbStatusCodeIndex]),
+				model.LabelName("lb_target_status_code"):  model.LabelValue(logLineMatch[targetStatusCodeIndex]),
+				model.LabelName("lb_lambda_error_reason"): model.LabelValue(logLineMatch[lambdaErrorReasonIndex]),
+			}
+
+			b.add(ctx, entry{ls.Merge(logLineLabelSet), logproto.Entry{
+				Line:      log_line,
+				Timestamp: timestamp,
+			}})
+		}
 		i++
 	}
 
