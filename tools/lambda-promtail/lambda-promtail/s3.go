@@ -27,6 +27,27 @@ var (
 
 	// regex that extracts the timestamp (RFC3339) from message log
 	timestampRegex = regexp.MustCompile(`\w+ (?P<timestamp>\d+-\d+-\d+T\d+:\d+:\d+\.\d+Z)`)
+
+	// regex that matches the format of a single line of an AWS Load Balancer log
+	// https://docs.aws.amazon.com/elasticloadbalancing/latest/application/load-balancer-access-logs.html
+	// https://docs.aws.amazon.com/athena/latest/ug/application-load-balancer-logs.html
+	loadBalancerLogLineRegex = regexp.MustCompile(`(?P<type>[^ ]*) (?P<time>[^ ]*) (?P<elb>[^ ]*) (?P<client_ip>[^ ]*):(?P<client_port>[0-9]*) (?P<target_ip>[^ ]*)[:-](?P<target_port>[0-9]*) (?P<request_processing_time>[-.0-9]*) (?P<target_processing_time>[-.0-9]*) (?P<response_processing_time>[-.0-9]*) (?P<elb_status_code>|[-0-9]*) (?P<target_status_code>-|[-0-9]*) (?P<received_bytes>[-0-9]*) (?P<sent_bytes>[-0-9]*) \"(?P<request_verb>[^ ]*) (?P<request_url>.*) (?P<request_proto>- |[^ ]*)\" \"(?P<user_agent>[^\"]*)\" (?P<ssl_cipher>[A-Z0-9-_]+) (?P<ssl_protocol>[A-Za-z0-9.-]*) (?P<target_group_arn>[^ ]*) \"(?P<trace_id>[^\"]*)\" \"(?P<domain_name>[^\"]*)\" \"(?P<chosen_cert_arn>[^\"]*)\" (?P<matched_rule_priority>[-.0-9]*) (?P<request_creation_time>[^ ]*) \"(?P<actions_executed>[^\"]*)\" \"(?P<redirect_url>[^\"]*)\" \"(?P<lambda_error_reason>[^ ]*)\" \"(?P<target_port_list>[^\s]+?)\" \"(?P<target_status_code_list>[^\s]+)\" \"(?P<classification>[^ ]*)\" \"(?P<classification_reason>[^ ]*)\"`)
+
+	// the indexes of the fields in the log that we want to create labels for
+	typeIndex              = loadBalancerLogLineRegex.SubexpIndex("type")
+	requestUrlIndex        = loadBalancerLogLineRegex.SubexpIndex("request_url") // we create a label for the endpoint of the url, not the full url
+	elbStatusCodeIndex     = loadBalancerLogLineRegex.SubexpIndex("elb_status_code")
+	targetStatusCodeIndex  = loadBalancerLogLineRegex.SubexpIndex("target_status_code")
+	lambdaErrorReasonIndex = loadBalancerLogLineRegex.SubexpIndex("lambda_error_reason")
+
+	// regex that matches the endpoint of a request url in a load balancer log line
+	// format:  protocol://host:port/uri
+	// example: https://omni-web.svc.us-dev1.dev.mintel.cloud:443/internal/sso/retrieveAccessRights
+	// result:  retrieveAccessRights
+	requestUrlEndpointRegex = regexp.MustCompile(`([^0-9/]*$)`)
+
+	// don't push load balancer logs with traffic to these endpoints to loki
+	skipEndpoints = map[string]struct{}{"external-health-check": {}, "healthz": {}, "readiness": {}, "healthy": {}, "metrics": {}, "readyz": {}}
 )
 
 func getS3Object(ctx context.Context, labels map[string]string) (io.ReadCloser, error) {
@@ -77,17 +98,30 @@ func parseS3Log(ctx context.Context, b *batch, labels map[string]string, obj io.
 	for scanner.Scan() {
 		i := 0
 		log_line := scanner.Text()
-		match := timestampRegex.FindStringSubmatch(log_line)
+		timestampMatch := timestampRegex.FindStringSubmatch(log_line)
+		logLineMatch := loadBalancerLogLineRegex.FindStringSubmatch(log_line)
 
-		timestamp, err := time.Parse(time.RFC3339, match[1])
+		timestamp, err := time.Parse(time.RFC3339, timestampMatch[1])
 		if err != nil {
 			return err
 		}
 
-		b.add(ctx, entry{ls, logproto.Entry{
-			Line:      log_line,
-			Timestamp: timestamp,
-		}})
+		targetEndpoint := requestUrlEndpointRegex.FindStringSubmatch(logLineMatch[requestUrlIndex])[1]
+
+		if _, skip := skipEndpoints[targetEndpoint]; !skip {
+			logLineLabelSet := model.LabelSet{
+				model.LabelName("lb_type"):                model.LabelValue(logLineMatch[typeIndex]),
+				model.LabelName("lb_target_endpoint"):     model.LabelValue(targetEndpoint),
+				model.LabelName("lb_elb_status_code"):     model.LabelValue(logLineMatch[elbStatusCodeIndex]),
+				model.LabelName("lb_target_status_code"):  model.LabelValue(logLineMatch[targetStatusCodeIndex]),
+				model.LabelName("lb_lambda_error_reason"): model.LabelValue(logLineMatch[lambdaErrorReasonIndex]),
+			}
+
+			b.add(ctx, entry{ls.Merge(logLineLabelSet), logproto.Entry{
+				Line:      log_line,
+				Timestamp: timestamp,
+			}})
+		}
 		i++
 	}
 
