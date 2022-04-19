@@ -36,7 +36,7 @@ var (
 	// the indexes of the fields in the log that we want to create labels for
 	typeIndex              = loadBalancerLogLineRegex.SubexpIndex("type")
 	targetPortIndex        = loadBalancerLogLineRegex.SubexpIndex("target_port")
-	requestUrlIndex        = loadBalancerLogLineRegex.SubexpIndex("request_url")
+	requestUrlIndex        = loadBalancerLogLineRegex.SubexpIndex("request_url") // we create a label for the endpoint of the url, not the full url
 	elbStatusCodeIndex     = loadBalancerLogLineRegex.SubexpIndex("elb_status_code")
 	targetStatusCodeIndex  = loadBalancerLogLineRegex.SubexpIndex("target_status_code")
 	lambdaErrorReasonIndex = loadBalancerLogLineRegex.SubexpIndex("lambda_error_reason")
