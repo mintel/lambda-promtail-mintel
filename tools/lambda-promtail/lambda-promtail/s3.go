@@ -35,7 +35,6 @@ var (
 
 	// the indexes of the fields in the log that we want to create labels for
 	typeIndex              = loadBalancerLogLineRegex.SubexpIndex("type")
-	targetPortIndex        = loadBalancerLogLineRegex.SubexpIndex("target_port")
 	requestUrlIndex        = loadBalancerLogLineRegex.SubexpIndex("request_url") // we create a label for the endpoint of the url, not the full url
 	elbStatusCodeIndex     = loadBalancerLogLineRegex.SubexpIndex("elb_status_code")
 	targetStatusCodeIndex  = loadBalancerLogLineRegex.SubexpIndex("target_status_code")
@@ -48,7 +47,7 @@ var (
 	requestUrlEndpointRegex = regexp.MustCompile(`([^0-9/]*$)`)
 
 	// don't push load balancer logs with traffic to these endpoints to loki
-	skipEndpoints = map[string]struct{}{"external-health-check": {}, "healthz": {}, "readiness": {}, "healthy": {}}
+	skipEndpoints = map[string]struct{}{"external-health-check": {}, "healthz": {}, "readiness": {}, "healthy": {}, "metrics": {}, "readyz": {}}
 )
 
 func getS3Object(ctx context.Context, labels map[string]string) (io.ReadCloser, error) {
@@ -112,7 +111,6 @@ func parseS3Log(ctx context.Context, b *batch, labels map[string]string, obj io.
 		if _, skip := skipEndpoints[targetEndpoint]; !skip {
 			logLineLabelSet := model.LabelSet{
 				model.LabelName("lb_type"):                model.LabelValue(logLineMatch[typeIndex]),
-				model.LabelName("lb_target_port"):         model.LabelValue(logLineMatch[targetPortIndex]),
 				model.LabelName("lb_target_endpoint"):     model.LabelValue(targetEndpoint),
 				model.LabelName("lb_elb_status_code"):     model.LabelValue(logLineMatch[elbStatusCodeIndex]),
 				model.LabelName("lb_target_status_code"):  model.LabelValue(logLineMatch[targetStatusCodeIndex]),
