@@ -88,9 +88,10 @@ func parseS3Log(ctx context.Context, b *batch, labels map[string]string, obj io.
 	scanner := bufio.NewScanner(gzreader)
 
 	ls := model.LabelSet{
-		model.LabelName("__aws_log_type"):        model.LabelValue("s3_lb"),
-		model.LabelName("__aws_s3_log_lb"):       model.LabelValue(labels["lb"]),
-		model.LabelName("__aws_s3_log_lb_owner"): model.LabelValue(labels["account_id"]),
+		model.LabelName("__aws_log_type"): model.LabelValue("s3_lb"),
+		model.LabelName("lb_name"):        model.LabelValue(labels["lb"]),
+		model.LabelName("lb_account_id"):  model.LabelValue(labels["account_id"]),
+		model.LabelName("lb_aws_region"):  model.LabelValue(labels["bucket_region"]),
 	}
 
 	ls = applyExtraLabels(ls)
@@ -111,7 +112,6 @@ func parseS3Log(ctx context.Context, b *batch, labels map[string]string, obj io.
 		if _, skip := skipEndpoints[targetEndpoint]; !skip {
 			logLineLabelSet := model.LabelSet{
 				model.LabelName("lb_type"):                model.LabelValue(logLineMatch[typeIndex]),
-				model.LabelName("lb_target_endpoint"):     model.LabelValue(targetEndpoint),
 				model.LabelName("lb_elb_status_code"):     model.LabelValue(logLineMatch[elbStatusCodeIndex]),
 				model.LabelName("lb_target_status_code"):  model.LabelValue(logLineMatch[targetStatusCodeIndex]),
 				model.LabelName("lb_lambda_error_reason"): model.LabelValue(logLineMatch[lambdaErrorReasonIndex]),
