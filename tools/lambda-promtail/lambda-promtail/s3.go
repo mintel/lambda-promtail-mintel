@@ -46,8 +46,12 @@ var (
 	// result:  retrieveAccessRights
 	requestUrlEndpointRegex = regexp.MustCompile(`([^0-9/]*$)`)
 
-	// don't push load balancer logs with traffic to these endpoints to loki
+	// for all accounts, don't push load balancer logs with traffic to these endpoints to loki
 	skipEndpoints = map[string]struct{}{"external-health-check": {}, "healthz": {}, "readiness": {}, "healthy": {}, "metrics": {}, "readyz": {}}
+
+	// if the load balancer is in the 'logs' aws account, don't push load balancer logs with traffic to these endpoints to loki
+	skipLogsAccountEndpoints = map[string]struct{}{"push": {}, "prometheus": {}}
+	logsAccountId            = "529633446764"
 )
 
 func getS3Object(ctx context.Context, labels map[string]string) (io.ReadCloser, error) {
@@ -87,10 +91,11 @@ func parseS3Log(ctx context.Context, b *batch, labels map[string]string, obj io.
 
 	scanner := bufio.NewScanner(gzreader)
 
+	accountId := labels["account_id"]
 	ls := model.LabelSet{
 		model.LabelName("__aws_log_type"): model.LabelValue("s3_lb"),
 		model.LabelName("lb_name"):        model.LabelValue(labels["lb"]),
-		model.LabelName("lb_account_id"):  model.LabelValue(labels["account_id"]),
+		model.LabelName("lb_account_id"):  model.LabelValue(accountId),
 		model.LabelName("lb_aws_region"):  model.LabelValue(labels["bucket_region"]),
 	}
 
@@ -109,7 +114,7 @@ func parseS3Log(ctx context.Context, b *batch, labels map[string]string, obj io.
 
 		targetEndpoint := requestUrlEndpointRegex.FindStringSubmatch(logLineMatch[requestUrlIndex])[1]
 
-		if _, skip := skipEndpoints[targetEndpoint]; !skip {
+		if !skipLog(targetEndpoint, accountId) {
 			logLineLabelSet := model.LabelSet{
 				model.LabelName("lb_type"):                model.LabelValue(logLineMatch[typeIndex]),
 				model.LabelName("lb_elb_status_code"):     model.LabelValue(logLineMatch[elbStatusCodeIndex]),
@@ -126,6 +131,15 @@ func parseS3Log(ctx context.Context, b *batch, labels map[string]string, obj io.
 	}
 
 	return nil
+}
+
+// Return true if record should be skipped and not pushed to loki.
+// We want to skip records containing a target endpoint that would clutter the logs, such as
+// health checks, readiness checks, and api calls to loki and prometheus on the monitoring cluster.
+func skipLog(targetEndpoint string, accountId string) bool {
+	_, skipFromAllAccounts := skipEndpoints[targetEndpoint]
+	_, skipFromLogsAccount := skipLogsAccountEndpoints[targetEndpoint]
+	return skipFromAllAccounts || (skipFromLogsAccount && accountId == logsAccountId)
 }
 
 func getLabels(record events.S3EventRecord) (map[string]string, error) {
