@@ -6,6 +6,9 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"math/rand"
+	"net/netip"
+	"net/url"
 	"regexp"
 	"time"
 
@@ -34,25 +37,106 @@ var (
 	loadBalancerLogLineRegex = regexp.MustCompile(`(?P<type>[^ ]*) (?P<time>[^ ]*) (?P<elb>[^ ]*) (?P<client_ip>[^ ]*):(?P<client_port>[0-9]*) (?P<target_ip>[^ ]*)[:-](?P<target_port>[0-9]*) (?P<request_processing_time>[-.0-9]*) (?P<target_processing_time>[-.0-9]*) (?P<response_processing_time>[-.0-9]*) (?P<elb_status_code>|[-0-9]*) (?P<target_status_code>-|[-0-9]*) (?P<received_bytes>[-0-9]*) (?P<sent_bytes>[-0-9]*) \"(?P<request_verb>[^ ]*) (?P<request_url>.*) (?P<request_proto>- |[^ ]*)\" \"(?P<user_agent>[^\"]*)\" (?P<ssl_cipher>[A-Z0-9-_]+) (?P<ssl_protocol>[A-Za-z0-9.-]*) (?P<target_group_arn>[^ ]*) \"(?P<trace_id>[^\"]*)\" \"(?P<domain_name>[^\"]*)\" \"(?P<chosen_cert_arn>[^\"]*)\" (?P<matched_rule_priority>[-.0-9]*) (?P<request_creation_time>[^ ]*) \"(?P<actions_executed>[^\"]*)\" \"(?P<redirect_url>[^\"]*)\" \"(?P<lambda_error_reason>[^ ]*)\" \"(?P<target_port_list>[^\s]+?)\" \"(?P<target_status_code_list>[^\s]+)\" \"(?P<classification>[^ ]*)\" \"(?P<classification_reason>[^ ]*)\"`)
 
 	// the indexes of the fields in the log that we want to create labels for
-	typeIndex              = loadBalancerLogLineRegex.SubexpIndex("type")
-	requestUrlIndex        = loadBalancerLogLineRegex.SubexpIndex("request_url") // we create a label for the endpoint of the url, not the full url
+	clientIPIndex          = loadBalancerLogLineRegex.SubexpIndex("client_ip")
 	elbStatusCodeIndex     = loadBalancerLogLineRegex.SubexpIndex("elb_status_code")
-	targetStatusCodeIndex  = loadBalancerLogLineRegex.SubexpIndex("target_status_code")
 	lambdaErrorReasonIndex = loadBalancerLogLineRegex.SubexpIndex("lambda_error_reason")
-
-	// regex that matches the endpoint of a request url in a load balancer log line
-	// format:  protocol://host:port/uri
-	// example: https://omni-web.svc.us-dev1.dev.mintel.cloud:443/internal/sso/retrieveAccessRights
-	// result:  retrieveAccessRights
-	requestUrlEndpointRegex = regexp.MustCompile(`([^0-9/]*$)`)
-
-	// for all accounts, don't push load balancer logs with traffic to these endpoints to loki
-	skipEndpoints = map[string]struct{}{"external-health-check": {}, "healthz": {}, "readiness": {}, "healthy": {}, "metrics": {}, "readyz": {}}
-
-	// if the load balancer is in the 'logs' aws account, don't push load balancer logs with traffic to these endpoints to loki
-	skipLogsAccountEndpoints = map[string]struct{}{"push": {}, "prometheus": {}}
-	logsAccountId            = "529633446764"
+	requestURLIndex        = loadBalancerLogLineRegex.SubexpIndex("request_url")
+	requestVerbIndex       = loadBalancerLogLineRegex.SubexpIndex("request_verb")
+	targetStatusCodeIndex  = loadBalancerLogLineRegex.SubexpIndex("target_status_code")
+	typeIndex              = loadBalancerLogLineRegex.SubexpIndex("type")
 )
+
+// S3SamplingConfig represents some pattern of S3 access logs that
+// should be dropped probabilistically.
+type S3SamplingConfig struct {
+	AccountIDs CommaSeparatedStringSet `json:"account"` // List of AWS account IDs to match on e.g. "123456789012,2345678901234".
+
+	// List of load balancer connection types.
+	// Valid values are `http`, `https`, `h2`, `grpcs`, `ws`, `wss`.
+	// See: https://docs.aws.amazon.com/elasticloadbalancing/latest/application/load-balancer-access-logs.html#access-log-entry-syntax
+	Types CommaSeparatedStringSet `json:"type"`
+
+	ClientIPAddresses CommaSeparatedCIDRSet      `json:"ip"`     // List of client IP CIDR blocks to match on e.g. "1.2.3.4/0,5.6.7.8/16".
+	Methods           CommaSeparatedStringSet    `json:"method"` // List of HTTP methods to match on e.g. "GET,PUT".
+	StatusCodes       CommaSeparatedStringSet    `json:"status"` // List of response status codes to match on e.g. "200,401".
+	Hosts             *CommaSeparatedHostnameSet `json:"host"`   // List of hostnames matched against the hostname of the request. Can include wildcards e.g. `*.example.org`.
+
+	// A regexp that will be matched against the path of the request.
+	Path       string `json:"path"`
+	pathRegexp *regexp.Regexp
+
+	// A probability between 0 and 1.
+	// If a log line matches the filters above, keep that log line with this probability.
+	KeepRate float64 `json:"keep"`
+}
+
+// Match returns true if a log line matches this sampling filter.
+func (conf *S3SamplingConfig) Match(accountID string, logLineMatch []string) bool {
+	if len(conf.AccountIDs) > 0 {
+		if !conf.AccountIDs.Contains(accountID) {
+			return false
+		}
+	}
+	if len(conf.Types) > 0 {
+		t := logLineMatch[typeIndex]
+		if !conf.Types.Contains(t) {
+			return false
+		}
+	}
+	if len(conf.Methods) > 0 {
+		m := logLineMatch[requestVerbIndex]
+		if !conf.Methods.Contains(m) {
+			return false
+		}
+	}
+	if len(conf.StatusCodes) > 0 {
+		c := logLineMatch[elbStatusCodeIndex]
+		if !conf.StatusCodes.Contains(c) {
+			return false
+		}
+	}
+	if len(conf.ClientIPAddresses) > 0 {
+		ip, err := netip.ParseAddr(logLineMatch[clientIPIndex])
+		if err != nil {
+			fmt.Println("warn: log IP cannot be parsed:", err)
+			return false
+		}
+		if !conf.ClientIPAddresses.Match(ip) {
+			return false
+		}
+	}
+	u, err := url.Parse(logLineMatch[requestURLIndex])
+	if err != nil {
+		fmt.Println("warn: log URL cannot be parsed:", err)
+		return false
+	}
+	if !conf.Hosts.IsZero() {
+		if !conf.Hosts.Match(u.Host) {
+			return false
+		}
+	}
+	if conf.Path != "" {
+		if conf.pathRegexp == nil {
+			conf.pathRegexp = regexp.MustCompile(conf.Path)
+		}
+		if !conf.pathRegexp.MatchString(u.Path) {
+			return false
+		}
+	}
+	return true
+}
+
+// Keep randomly returns true or false at a rate depending on conf.KeepRate.
+// A KeepRate of 0.1 will return true on 10% of calls to Keep.
+func (conf *S3SamplingConfig) Keep() bool {
+	if conf.KeepRate == 0 {
+		return false
+	}
+	if conf.KeepRate == 1 {
+		return true
+	}
+	return rand.Float64() <= conf.KeepRate
+}
 
 func getS3Object(ctx context.Context, labels map[string]string) (io.ReadCloser, error) {
 	var s3Client *s3.Client
@@ -112,9 +196,7 @@ func parseS3Log(ctx context.Context, b *batch, labels map[string]string, obj io.
 			return err
 		}
 
-		targetEndpoint := requestUrlEndpointRegex.FindStringSubmatch(logLineMatch[requestUrlIndex])[1]
-
-		if !skipLog(targetEndpoint, accountId) {
+		if keepLog(accountId, logLineMatch) {
 			logLineLabelSet := model.LabelSet{
 				model.LabelName("lb_type"):                model.LabelValue(logLineMatch[typeIndex]),
 				model.LabelName("lb_elb_status_code"):     model.LabelValue(logLineMatch[elbStatusCodeIndex]),
@@ -133,13 +215,14 @@ func parseS3Log(ctx context.Context, b *batch, labels map[string]string, obj io.
 	return nil
 }
 
-// Return true if record should be skipped and not pushed to loki.
-// We want to skip records containing a target endpoint that would clutter the logs, such as
-// health checks, readiness checks, and api calls to loki and prometheus on the monitoring cluster.
-func skipLog(targetEndpoint string, accountId string) bool {
-	_, skipFromAllAccounts := skipEndpoints[targetEndpoint]
-	_, skipFromLogsAccount := skipLogsAccountEndpoints[targetEndpoint]
-	return skipFromAllAccounts || (skipFromLogsAccount && accountId == logsAccountId)
+// Return true if record should be pushed to loki.
+func keepLog(accountId string, logLineMatch []string) bool {
+	for _, conf := range s3SampleFilters {
+		if conf.Match(accountId, logLineMatch) {
+			return conf.Keep()
+		}
+	}
+	return true
 }
 
 func getLabels(record events.S3EventRecord) (map[string]string, error) {
