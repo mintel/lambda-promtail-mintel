@@ -33,6 +33,7 @@ var (
 	batchSize                          int
 	s3Clients                          map[string]*s3.Client
 	extraLabels                        model.LabelSet
+	s3SampleFilters                    []*S3SamplingConfig
 )
 
 func setupArguments() {
@@ -76,6 +77,13 @@ func setupArguments() {
 	}
 
 	s3Clients = make(map[string]*s3.Client)
+
+	s3Sampling := os.Getenv("SAMPLE_S3")
+	if s3Sampling != "" {
+		if err := json.Unmarshal([]byte(s3Sampling), &s3SampleFilters); err != nil {
+			panic(err)
+		}
+	}
 }
 
 func parseExtraLabels(extraLabelsRaw string) (model.LabelSet, error) {
