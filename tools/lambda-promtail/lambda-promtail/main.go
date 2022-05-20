@@ -33,6 +33,7 @@ var (
 	batchSize                          int
 	s3Clients                          map[string]*s3.Client
 	extraLabels                        model.LabelSet
+	cloudWatchSampleFilters            []*CloudWatchSamplingConfig
 	s3SampleFilters                    []*S3SamplingConfig
 )
 
@@ -77,6 +78,13 @@ func setupArguments() {
 	}
 
 	s3Clients = make(map[string]*s3.Client)
+
+	cloudWatchSampling := os.Getenv("SAMPLE_CLOUDWATCH")
+	if cloudWatchSampling != "" {
+		if err := json.Unmarshal([]byte(cloudWatchSampling), &cloudWatchSampleFilters); err != nil {
+			panic(err)
+		}
+	}
 
 	s3Sampling := os.Getenv("SAMPLE_S3")
 	if s3Sampling != "" {

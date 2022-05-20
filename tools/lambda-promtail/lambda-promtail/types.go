@@ -108,3 +108,43 @@ func (set *CommaSeparatedHostnameSet) IsZero() bool {
 	}
 	return set.pattern == "^()$"
 }
+
+// RegexpString represents a JSON-encoded regexp pattern that can be unmarshaled.
+type RegexpString struct {
+	*regexp.Regexp
+	Value string
+}
+
+func (rs *RegexpString) UnmarshalJSON(data []byte) error {
+	var s string
+	err := json.Unmarshal(data, &s)
+	if err != nil {
+		return err
+	}
+	var p *regexp.Regexp
+	if s != "" {
+		p, err = regexp.Compile(s)
+		if err != nil {
+			return err
+		}
+	}
+	*rs = RegexpString{
+		Value:  s,
+		Regexp: p,
+	}
+	return nil
+}
+
+func (rs *RegexpString) String() string {
+	return rs.Value
+}
+
+func (rs *RegexpString) IsZero() bool {
+	if rs == nil {
+		return true
+	}
+	if rs.Value == "" || rs.Regexp == nil {
+		return true
+	}
+	return false
+}
