@@ -88,19 +88,24 @@ func parseCWEvent(ctx context.Context, b *batch, ev *events.CloudwatchLogsEvent)
 		labels[model.LabelName("__aws_cloudwatch_log_stream")] = model.LabelValue(data.LogStream)
 	}
 
-	var matchingSampleConf *CloudWatchSamplingConfig
+	var matchingSampleConfs []*CloudWatchSamplingConfig
 	for _, c := range cloudWatchSampleFilters {
 		if c.MatchStream(data.Owner, data.LogGroup, data.LogStream) {
-			matchingSampleConf = c
-			break
+			matchingSampleConfs = append(matchingSampleConfs, c)
 		}
 	}
 
 	labels = applyExtraLabels(labels)
 
+outer:
 	for _, event := range data.LogEvents {
-		if matchingSampleConf != nil && matchingSampleConf.MatchLine(event.Message) && !matchingSampleConf.Keep() {
-			continue
+		for _, c := range matchingSampleConfs {
+			if c.MatchLine(event.Message) {
+				if !c.Keep() {
+					continue outer
+				}
+				break
+			}
 		}
 
 		timestamp := time.UnixMilli(event.Timestamp)
