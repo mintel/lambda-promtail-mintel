@@ -62,8 +62,7 @@ type S3SamplingConfig struct {
 	Hosts             *CommaSeparatedHostnameSet `json:"host"`   // List of hostnames matched against the hostname of the request. Can include wildcards e.g. `*.example.org`.
 
 	// A regexp that will be matched against the path of the request.
-	Path       string `json:"path"`
-	pathRegexp *regexp.Regexp
+	Path *RegexpString `json:"path"`
 
 	// A probability between 0 and 1.
 	// If a log line matches the filters above, keep that log line with this probability.
@@ -115,11 +114,8 @@ func (conf *S3SamplingConfig) Match(accountID string, logLineMatch []string) boo
 			return false
 		}
 	}
-	if conf.Path != "" {
-		if conf.pathRegexp == nil {
-			conf.pathRegexp = regexp.MustCompile(conf.Path)
-		}
-		if !conf.pathRegexp.MatchString(u.Path) {
+	if !conf.Path.IsZero() {
+		if !conf.Path.MatchString(u.Path) {
 			return false
 		}
 	}
