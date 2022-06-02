@@ -14,10 +14,12 @@ import (
 
 	"github.com/aws/aws-lambda-go/events"
 	"github.com/grafana/loki/pkg/logproto"
+	ttlcache "github.com/jellydator/ttlcache/v3"
 	"github.com/prometheus/common/model"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
-	"github.com/aws/aws-sdk-go-v2/config"
+	"github.com/aws/aws-sdk-go-v2/aws/arn"
+	"github.com/aws/aws-sdk-go-v2/service/elasticloadbalancingv2"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
 )
 
@@ -38,10 +40,12 @@ var (
 
 	// the indexes of the fields in the log that we want to create labels for
 	clientIPIndex          = loadBalancerLogLineRegex.SubexpIndex("client_ip")
+	elbIndex               = loadBalancerLogLineRegex.SubexpIndex("elb")
 	elbStatusCodeIndex     = loadBalancerLogLineRegex.SubexpIndex("elb_status_code")
 	lambdaErrorReasonIndex = loadBalancerLogLineRegex.SubexpIndex("lambda_error_reason")
 	requestURLIndex        = loadBalancerLogLineRegex.SubexpIndex("request_url")
 	requestVerbIndex       = loadBalancerLogLineRegex.SubexpIndex("request_verb")
+	targetGroupARNIndex    = loadBalancerLogLineRegex.SubexpIndex("target_group_arn")
 	targetStatusCodeIndex  = loadBalancerLogLineRegex.SubexpIndex("target_status_code")
 	typeIndex              = loadBalancerLogLineRegex.SubexpIndex("type")
 )
@@ -135,17 +139,9 @@ func (conf *S3SamplingConfig) Keep() bool {
 }
 
 func getS3Object(ctx context.Context, labels map[string]string) (io.ReadCloser, error) {
-	var s3Client *s3.Client
-
-	if c, ok := s3Clients[labels["bucket_region"]]; ok {
-		s3Client = c
-	} else {
-		cfg, err := config.LoadDefaultConfig(ctx, config.WithRegion(labels["bucket_region"]))
-		if err != nil {
-			return nil, err
-		}
-		s3Client = s3.NewFromConfig(cfg)
-		s3Clients[labels["bucket_region"]] = s3Client
+	s3Client, err := getS3Client(ctx, labels["bucket_region"])
+	if err != nil {
+		return nil, err
 	}
 
 	obj, err := s3Client.GetObject(ctx,
@@ -176,10 +172,12 @@ func parseS3Log(ctx context.Context, b *batch, labels map[string]string, obj io.
 		model.LabelName("__aws_log_type"): model.LabelValue("s3_lb"),
 		model.LabelName("lb_name"):        model.LabelValue(labels["lb"]),
 		model.LabelName("lb_account_id"):  model.LabelValue(accountId),
-		model.LabelName("lb_aws_region"):  model.LabelValue(labels["bucket_region"]),
+		model.LabelName("lb_aws_region"):  model.LabelValue(labels["region"]),
 	}
 
 	ls = applyExtraLabels(ls)
+
+	var lbTagLabels model.LabelSet
 
 	for scanner.Scan() {
 		i := 0
@@ -200,6 +198,32 @@ func parseS3Log(ctx context.Context, b *batch, labels map[string]string, obj io.
 				model.LabelName("lb_lambda_error_reason"): model.LabelValue(logLineMatch[lambdaErrorReasonIndex]),
 			}
 
+			lbARN := ""
+			if len(logLineMatch[elbIndex]) > 1 {
+				lbARN = arn.ARN{
+					Partition: "aws",
+					Service:   "elasticloadbalancing",
+					Region:    labels["region"],
+					AccountID: accountId,
+					Resource:  "loadbalancer/" + logLineMatch[elbIndex],
+				}.String()
+			}
+
+			if lbTagLabels == nil {
+				// We only need to do this one since all log lines in the same S3 object belong to the same load balancer.
+				lbTagLabels, err = applyLBResourceTags(ctx, lbTagsConf, labels["region"], lbARN)
+				if err != nil {
+					return err
+				}
+			}
+			logLineLabelSet = logLineLabelSet.Merge(lbTagLabels)
+
+			tgTagLabels, err := applyLBResourceTags(ctx, tgTagsConf, labels["region"], logLineMatch[targetGroupARNIndex])
+			if err != nil {
+				return err
+			}
+			logLineLabelSet = logLineLabelSet.Merge(tgTagLabels)
+
 			b.add(ctx, entry{ls.Merge(logLineLabelSet), logproto.Entry{
 				Line:      log_line,
 				Timestamp: timestamp,
@@ -209,6 +233,51 @@ func parseS3Log(ctx context.Context, b *batch, labels map[string]string, obj io.
 	}
 
 	return nil
+}
+
+func applyLBResourceTags(ctx context.Context, tagsToExtract map[string]string, awsRegion, ARN string) (model.LabelSet, error) {
+	if len(tagsToExtract) == 0 || ARN == "" || ARN == "-" {
+		return nil, nil
+	}
+
+	lbLabels := make(model.LabelSet, len(lbTagsConf))
+
+	var tags map[string]string
+	if cacheEntry := tagsCache.Get(ARN); cacheEntry != nil {
+		tags = cacheEntry.Value()
+	} else {
+		lbClient, err := getLBClient(ctx, awsRegion)
+		if err != nil {
+			fmt.Println("error getting LB", err)
+			return nil, err
+		}
+
+		resp, err := lbClient.DescribeTags(ctx, &elasticloadbalancingv2.DescribeTagsInput{
+			ResourceArns: []string{ARN},
+		})
+		if err != nil {
+			fmt.Println("error getting tags", err)
+			return nil, err
+		}
+
+		tags = make(map[string]string)
+		for _, tagDesc := range resp.TagDescriptions {
+			for _, tag := range tagDesc.Tags {
+				tags[aws.ToString(tag.Key)] = aws.ToString(tag.Value)
+			}
+		}
+
+		tagsCache.Set(ARN, tags, ttlcache.DefaultTTL)
+	}
+
+	for tag, label := range tagsToExtract {
+		if label == "" {
+			label = tag
+		}
+		lbLabels[model.LabelName(label)] = model.LabelValue(tags[tag])
+	}
+
+	return lbLabels, nil
 }
 
 // Return true if record should be pushed to loki.
@@ -221,7 +290,7 @@ func keepLog(accountId string, logLineMatch []string) bool {
 	return true
 }
 
-func getLabels(record events.S3EventRecord) (map[string]string, error) {
+func getObjLabels(record events.S3EventRecord) (map[string]string, error) {
 
 	labels := make(map[string]string)
 
@@ -247,7 +316,7 @@ func processS3Event(ctx context.Context, ev *events.S3Event) error {
 	batch, _ := newBatch(ctx)
 
 	for _, record := range ev.Records {
-		labels, err := getLabels(record)
+		labels, err := getObjLabels(record)
 		if err != nil {
 			return err
 		}
