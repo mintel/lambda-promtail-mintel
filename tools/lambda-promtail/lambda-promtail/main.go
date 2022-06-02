@@ -9,12 +9,13 @@ import (
 	"os"
 	"strconv"
 	"strings"
+	"time"
 
+	ttlcache "github.com/jellydator/ttlcache/v3"
 	"github.com/prometheus/common/model"
 
 	"github.com/aws/aws-lambda-go/events"
 	"github.com/aws/aws-lambda-go/lambda"
-	"github.com/aws/aws-sdk-go-v2/service/s3"
 )
 
 const (
@@ -31,12 +32,22 @@ var (
 	username, password, extraLabelsRaw string
 	keepStream                         bool
 	batchSize                          int
-	s3Clients                          map[string]*s3.Client
 	extraLabels                        model.LabelSet
 	cloudWatchSampleFilters            []*CloudWatchSamplingConfig
 	s3SampleFilters                    []*S3SamplingConfig
+	lbTagsConf                         map[string]string
+	tgTagsConf                         map[string]string
+
+	// TTL cache ARN to AWS resource tags.
+	tagsCache = ttlcache.New(
+		ttlcache.WithTTL[string, map[string]string](30*time.Second),
+		ttlcache.WithDisableTouchOnHit[string, map[string]string](),
+	)
 )
 
+func init() {
+	go tagsCache.Start()
+}
 func setupArguments() {
 	addr := os.Getenv("WRITE_ADDRESS")
 	if addr == "" {
@@ -77,8 +88,6 @@ func setupArguments() {
 		batchSize, _ = strconv.Atoi(batch)
 	}
 
-	s3Clients = make(map[string]*s3.Client)
-
 	cloudWatchSampling := os.Getenv("SAMPLE_CLOUDWATCH")
 	if cloudWatchSampling != "" {
 		if err := json.Unmarshal([]byte(cloudWatchSampling), &cloudWatchSampleFilters); err != nil {
@@ -90,6 +99,36 @@ func setupArguments() {
 	if s3Sampling != "" {
 		if err := json.Unmarshal([]byte(s3Sampling), &s3SampleFilters); err != nil {
 			panic(err)
+		}
+	}
+
+	// Extract tags on the load balancer as Loki labels.
+	// This can only work if lambda-promtail is deployed in the same account as the load balancer.
+	// Take a comma-separated list of string. Example:
+	//
+	//   Foo,Bar=baz
+	//
+	// Tag "Foo" would be extracted as label "Foo", and tag "Bar" would be extracted as label "baz".
+	if c := os.Getenv("EXTRACT_LB_TAGS"); c != "" {
+		lbTagsConf = make(map[string]string)
+		for _, part := range strings.Split(c, ",") {
+			tag, label, _ := strings.Cut(part, "=")
+			lbTagsConf[tag] = label
+		}
+	}
+
+	// Extract tags on the target group as Loki labels.
+	// This can only work if lambda-promtail is deployed in the same account as the load balancer.
+	// Take a comma-separated list of string. Example:
+	//
+	//   Foo,Bar=baz
+	//
+	// Tag "Foo" would be extracted as label "Foo", and tag "Bar" would be extracted as label "baz".
+	if c := os.Getenv("EXTRACT_TG_TAGS"); c != "" {
+		tgTagsConf = make(map[string]string)
+		for _, part := range strings.Split(c, ",") {
+			tag, label, _ := strings.Cut(part, "=")
+			tgTagsConf[tag] = label
 		}
 	}
 }
