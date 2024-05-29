@@ -28,15 +28,15 @@ const (
 )
 
 var (
-	writeAddress                       *url.URL
-	username, password, extraLabelsRaw string
-	keepStream                         bool
-	batchSize                          int
-	extraLabels                        model.LabelSet
-	cloudWatchSampleFilters            []*CloudWatchSamplingConfig
-	s3SampleFilters                    []*S3SamplingConfig
-	lbTagsConf                         map[string]string
-	tgTagsConf                         map[string]string
+	writeAddress                                 *url.URL
+	username, password, extraLabelsRaw, tenantID string
+	keepStream                                   bool
+	batchSize                                    int
+	extraLabels                                  model.LabelSet
+	cloudWatchSampleFilters                      []*CloudWatchSamplingConfig
+	s3SampleFilters                              []*S3SamplingConfig
+	lbTagsConf                                   map[string]string
+	tgTagsConf                                   map[string]string
 
 	// TTL cache ARN to AWS resource tags.
 	tagsCache = ttlcache.New(
@@ -74,6 +74,8 @@ func setupArguments() {
 	if (username != "" && password == "") || (username == "" && password != "") {
 		panic("both username and password must be set if either one is set")
 	}
+
+	tenantID = os.Getenv("TENANT_ID")
 
 	keep := os.Getenv("KEEP_STREAM")
 	// Anything other than case-insensitive 'true' is treated as 'false'.
