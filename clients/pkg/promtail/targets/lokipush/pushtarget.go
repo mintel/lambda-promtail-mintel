@@ -2,7 +2,7 @@ package lokipush
 
 import (
 	"bufio"
-	"flag"
+	"fmt"
 	"io"
 	"net/http"
 	"sort"
@@ -11,23 +11,23 @@ import (
 
 	"github.com/go-kit/log"
 	"github.com/go-kit/log/level"
-	"github.com/imdario/mergo"
+	"github.com/grafana/dskit/server"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/common/model"
 	"github.com/prometheus/prometheus/model/labels"
 	"github.com/prometheus/prometheus/model/relabel"
 	promql_parser "github.com/prometheus/prometheus/promql/parser"
-	"github.com/weaveworks/common/server"
 
 	"github.com/grafana/dskit/tenant"
 
-	"github.com/grafana/loki/clients/pkg/promtail/api"
-	"github.com/grafana/loki/clients/pkg/promtail/scrapeconfig"
-	"github.com/grafana/loki/clients/pkg/promtail/targets/target"
+	"github.com/grafana/loki/v3/clients/pkg/promtail/api"
+	"github.com/grafana/loki/v3/clients/pkg/promtail/scrapeconfig"
+	"github.com/grafana/loki/v3/clients/pkg/promtail/targets/serverutils"
+	"github.com/grafana/loki/v3/clients/pkg/promtail/targets/target"
 
-	"github.com/grafana/loki/pkg/loghttp/push"
-	"github.com/grafana/loki/pkg/logproto"
-	util_log "github.com/grafana/loki/pkg/util/log"
+	"github.com/grafana/loki/v3/pkg/loghttp/push"
+	"github.com/grafana/loki/v3/pkg/logproto"
+	util_log "github.com/grafana/loki/v3/pkg/util/log"
 )
 
 type PushTarget struct {
@@ -54,26 +54,14 @@ func NewPushTarget(logger log.Logger,
 		config:        config,
 	}
 
-	// Bit of a chicken and egg problem trying to register the defaults and apply overrides from the loaded config.
-	// First create an empty config and set defaults.
-	defaults := server.Config{}
-	defaults.RegisterFlags(flag.NewFlagSet("empty", flag.ContinueOnError))
-	// Then apply any config values loaded as overrides to the defaults.
-	if err := mergo.Merge(&defaults, config.Server, mergo.WithOverride); err != nil {
-		level.Error(logger).Log("msg", "failed to parse configs and override defaults when configuring push server", "err", err)
-	}
-	// The merge won't overwrite with a zero value but in the case of ports 0 value
-	// indicates the desire for a random port so reset these to zero if the incoming config val is 0
-	if config.Server.HTTPListenPort == 0 {
-		defaults.HTTPListenPort = 0
-	}
-	if config.Server.GRPCListenPort == 0 {
-		defaults.GRPCListenPort = 0
+	mergedServerConfigs, err := serverutils.MergeWithDefaults(config.Server)
+	if err != nil {
+		return nil, fmt.Errorf("failed to parse configs and override defaults when configuring loki push target: %w", err)
 	}
 	// Set the config to the new combined config.
-	config.Server = defaults
+	config.Server = mergedServerConfigs
 
-	err := pt.run()
+	err = pt.run()
 	if err != nil {
 		return nil, err
 	}
@@ -91,7 +79,14 @@ func (t *PushTarget) run() error {
 
 	// The logger registers a metric which will cause a duplicate registry panic unless we provide an empty registry
 	// The metric created is for counting log lines and isn't likely to be missed.
-	util_log.InitLogger(&t.config.Server, prometheus.NewRegistry())
+	serverCfg := &t.config.Server
+	serverCfg.Log = util_log.InitLogger(serverCfg, prometheus.NewRegistry(), false)
+
+	// Set new registry for upcoming metric server
+	// If not, it'll likely panic when the tool gets reloaded.
+	if t.config.Server.Registerer == nil {
+		t.config.Server.Registerer = prometheus.NewRegistry()
+	}
 
 	srv, err := server.New(t.config.Server)
 	if err != nil {
@@ -101,6 +96,7 @@ func (t *PushTarget) run() error {
 	t.server = srv
 	t.server.HTTP.Path("/loki/api/v1/push").Methods("POST").Handler(http.HandlerFunc(t.handleLoki))
 	t.server.HTTP.Path("/promtail/api/v1/raw").Methods("POST").Handler(http.HandlerFunc(t.handlePlaintext))
+	t.server.HTTP.Path("/ready").Methods("GET").Handler(http.HandlerFunc(t.ready))
 
 	go func() {
 		err := srv.Run()
@@ -115,7 +111,7 @@ func (t *PushTarget) run() error {
 func (t *PushTarget) handleLoki(w http.ResponseWriter, r *http.Request) {
 	logger := util_log.WithContext(r.Context(), util_log.Logger)
 	userID, _ := tenant.TenantID(r.Context())
-	req, err := push.ParseRequest(logger, userID, r, nil)
+	req, err := push.ParseRequest(logger, userID, r, nil, push.EmptyLimits{}, push.ParseLokiRequest, nil)
 	if err != nil {
 		level.Warn(t.logger).Log("msg", "failed to parse incoming push request", "err", err.Error())
 		http.Error(w, err.Error(), http.StatusBadRequest)
@@ -138,8 +134,8 @@ func (t *PushTarget) handleLoki(w http.ResponseWriter, r *http.Request) {
 		}
 
 		// Apply relabeling
-		processed := relabel.Process(lb.Labels(), t.relabelConfig...)
-		if processed == nil || len(processed) == 0 {
+		processed, keep := relabel.Process(lb.Labels(), t.relabelConfig...)
+		if !keep || len(processed) == 0 {
 			w.WriteHeader(http.StatusNoContent)
 			return
 		}
@@ -245,4 +241,12 @@ func (t *PushTarget) Stop() error {
 	t.server.Shutdown()
 	t.handler.Stop()
 	return nil
+}
+
+// ready function serves the ready endpoint
+func (t *PushTarget) ready(w http.ResponseWriter, _ *http.Request) {
+	resp := "ready"
+	if _, err := w.Write([]byte(resp)); err != nil {
+		level.Error(t.logger).Log("msg", "failed to respond to ready endoint", "err", err)
+	}
 }

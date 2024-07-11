@@ -6,10 +6,10 @@ import (
 	"os"
 	"time"
 
-	"github.com/grafana/loki/operator/internal/sizes"
+	"github.com/ViaQ/logerr/v2/log"
 	"github.com/prometheus/common/model"
 
-	"github.com/ViaQ/logerr/log"
+	"github.com/grafana/loki/operator/internal/sizes"
 )
 
 const (
@@ -29,9 +29,9 @@ const (
 	sizeOneXMedium string = "1x.medium"
 )
 
-var logger = log.NewLogger("size-calculator")
-
 func main() {
+	logger := log.NewLogger("size-calculator")
+
 	logger.Info("starting storage size calculator...")
 
 	for {

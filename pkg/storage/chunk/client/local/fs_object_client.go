@@ -10,13 +10,13 @@ import (
 	"time"
 
 	"github.com/go-kit/log/level"
+	"github.com/grafana/dskit/runutil"
 	"github.com/pkg/errors"
-	"github.com/thanos-io/thanos/pkg/runutil"
 
-	"github.com/grafana/loki/pkg/ruler/rulestore/local"
-	"github.com/grafana/loki/pkg/storage/chunk/client"
-	"github.com/grafana/loki/pkg/storage/chunk/client/util"
-	util_log "github.com/grafana/loki/pkg/util/log"
+	"github.com/grafana/loki/v3/pkg/ruler/rulestore/local"
+	"github.com/grafana/loki/v3/pkg/storage/chunk/client"
+	"github.com/grafana/loki/v3/pkg/storage/chunk/client/util"
+	util_log "github.com/grafana/loki/v3/pkg/util/log"
 )
 
 // FSConfig is the config for a FSObjectClient.
@@ -65,6 +65,16 @@ func NewFSObjectClient(cfg FSConfig) (*FSObjectClient, error) {
 // Stop implements ObjectClient
 func (FSObjectClient) Stop() {}
 
+func (f *FSObjectClient) ObjectExists(_ context.Context, objectKey string) (bool, error) {
+	fullPath := filepath.Join(f.cfg.Directory, filepath.FromSlash(objectKey))
+	_, err := os.Lstat(fullPath)
+	if err != nil {
+		return false, err
+	}
+
+	return true, nil
+}
+
 // GetObject from the store
 func (f *FSObjectClient) GetObject(_ context.Context, objectKey string) (io.ReadCloser, int64, error) {
 	fl, err := os.Open(filepath.Join(f.cfg.Directory, filepath.FromSlash(objectKey)))
@@ -108,7 +118,7 @@ func (f *FSObjectClient) PutObject(_ context.Context, objectKey string, object i
 
 // List implements chunk.ObjectClient.
 // FSObjectClient assumes that prefix is a directory, and only supports "" and "/" delimiters.
-func (f *FSObjectClient) List(ctx context.Context, prefix, delimiter string) ([]client.StorageObject, []client.StorageCommonPrefix, error) {
+func (f *FSObjectClient) List(_ context.Context, prefix, delimiter string) ([]client.StorageObject, []client.StorageCommonPrefix, error) {
 	if delimiter != "" && delimiter != "/" {
 		return nil, nil, fmt.Errorf("unsupported delimiter: %q", delimiter)
 	}
@@ -171,7 +181,7 @@ func (f *FSObjectClient) List(ctx context.Context, prefix, delimiter string) ([]
 	return storageObjects, commonPrefixes, err
 }
 
-func (f *FSObjectClient) DeleteObject(ctx context.Context, objectKey string) error {
+func (f *FSObjectClient) DeleteObject(_ context.Context, objectKey string) error {
 	// inspired from https://github.com/thanos-io/thanos/blob/55cb8ca38b3539381dc6a781e637df15c694e50a/pkg/objstore/filesystem/filesystem.go#L195
 	file := filepath.Join(f.cfg.Directory, filepath.FromSlash(objectKey))
 
@@ -195,7 +205,7 @@ func (f *FSObjectClient) DeleteObject(ctx context.Context, objectKey string) err
 }
 
 // DeleteChunksBefore implements BucketClient
-func (f *FSObjectClient) DeleteChunksBefore(ctx context.Context, ts time.Time) error {
+func (f *FSObjectClient) DeleteChunksBefore(_ context.Context, ts time.Time) error {
 	return filepath.Walk(f.cfg.Directory, func(path string, info os.FileInfo, err error) error {
 		if !info.IsDir() && info.ModTime().Before(ts) {
 			level.Info(util_log.Logger).Log("msg", "file has exceeded the retention period, removing it", "filepath", info.Name())
@@ -211,6 +221,9 @@ func (f *FSObjectClient) DeleteChunksBefore(ctx context.Context, ts time.Time) e
 func (f *FSObjectClient) IsObjectNotFoundErr(err error) bool {
 	return os.IsNotExist(errors.Cause(err))
 }
+
+// TODO(dannyk): implement for client
+func (f *FSObjectClient) IsRetryableErr(error) bool { return false }
 
 // copied from https://github.com/thanos-io/thanos/blob/55cb8ca38b3539381dc6a781e637df15c694e50a/pkg/objstore/filesystem/filesystem.go#L181
 func isDirEmpty(name string) (ok bool, err error) {

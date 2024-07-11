@@ -9,7 +9,6 @@
 (import 'distributor.libsonnet') +
 (import 'ingester.libsonnet') +
 (import 'querier.libsonnet') +
-(import 'table-manager.libsonnet') +
 (import 'query-frontend.libsonnet') +
 (import 'ruler.libsonnet') +
 
@@ -21,11 +20,22 @@
 (import 'memcached.libsonnet') +
 (import 'overrides-exporter.libsonnet') +
 
-// WAL support
-(import 'wal.libsonnet') +
-
 // Index Gateway support
 (import 'index-gateway.libsonnet') +
 
-// BoltDB Shipper support. This should be the last one to get imported.
-(import 'boltdb_shipper.libsonnet')
+// BoltDB and TSDB Shipper support. Anything that modifies the compactor must be imported after this.
+(import 'shipper.libsonnet') +
+
+(import 'table-manager.libsonnet') +
+
+// Multi-zone ingester related config
+(import 'multi-zone.libsonnet') +
+
+// Memberlist related deployment configuration, mostly migration related
+(import 'memberlist.libsonnet') +
+
+// Prometheus ServiceMonitor
+(import 'servicemonitor.libsonnet') +
+
+// Patterns ingester
+(import 'patterns.libsonnet')

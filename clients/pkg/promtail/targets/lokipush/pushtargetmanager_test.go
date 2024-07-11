@@ -3,9 +3,9 @@ package lokipush
 import (
 	"testing"
 
-	"github.com/weaveworks/common/server"
+	"github.com/grafana/dskit/server"
 
-	"github.com/grafana/loki/clients/pkg/promtail/scrapeconfig"
+	"github.com/grafana/loki/v3/clients/pkg/promtail/scrapeconfig"
 )
 
 func Test_validateJobName(t *testing.T) {
@@ -57,6 +57,19 @@ func Test_validateJobName(t *testing.T) {
 				},
 			},
 			wantErr: true,
+		},
+		{
+			name: "validate with special characters",
+			configs: []scrapeconfig.Config{
+				{
+					JobName: "job$1-2!3@4*job",
+					PushConfig: &scrapeconfig.PushTargetConfig{
+						Server: server.Config{},
+					},
+				},
+			},
+			wantErr:     false,
+			expectedJob: "job_1_2_3_4_job",
 		},
 	}
 	for _, tt := range tests {

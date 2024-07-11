@@ -3,16 +3,16 @@ package lokipush
 import (
 	"errors"
 	"fmt"
-	"strings"
 
 	"github.com/go-kit/log"
 	"github.com/go-kit/log/level"
 	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/prometheus/util/strutil"
 
-	"github.com/grafana/loki/clients/pkg/logentry/stages"
-	"github.com/grafana/loki/clients/pkg/promtail/api"
-	"github.com/grafana/loki/clients/pkg/promtail/scrapeconfig"
-	"github.com/grafana/loki/clients/pkg/promtail/targets/target"
+	"github.com/grafana/loki/v3/clients/pkg/logentry/stages"
+	"github.com/grafana/loki/v3/clients/pkg/promtail/api"
+	"github.com/grafana/loki/v3/clients/pkg/promtail/scrapeconfig"
+	"github.com/grafana/loki/v3/clients/pkg/promtail/targets/target"
 )
 
 // PushTargetManager manages a series of PushTargets.
@@ -69,7 +69,7 @@ func validateJobName(scrapeConfigs []scrapeconfig.Config) error {
 		}
 		jobNames[cfg.JobName] = struct{}{}
 
-		scrapeConfigs[i].JobName = strings.Replace(cfg.JobName, " ", "_", -1)
+		scrapeConfigs[i].JobName = strutil.SanitizeLabelName(cfg.JobName)
 	}
 	return nil
 }

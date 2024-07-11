@@ -9,7 +9,7 @@ import (
 	"github.com/prometheus/client_golang/prometheus"
 	"golang.org/x/time/rate"
 
-	"github.com/grafana/loki/clients/pkg/promtail/api"
+	"github.com/grafana/loki/v3/clients/pkg/promtail/api"
 )
 
 // PipelineStages contains configuration for each stage within a pipeline
@@ -28,6 +28,13 @@ type Pipeline struct {
 	stages    []Stage
 	jobName   *string
 	dropCount *prometheus.CounterVec
+}
+
+// Cleanup implements Stage.
+func (p *Pipeline) Cleanup() {
+	for _, s := range p.stages {
+		s.Cleanup()
+	}
 }
 
 // NewPipeline creates a new log entry pipeline from a configuration
@@ -71,6 +78,42 @@ func RunWith(input chan Entry, process func(e Entry) Entry) chan Entry {
 			out <- process(e)
 		}
 	}()
+	return out
+}
+
+// RunWithSkip same as RunWith, except it skip sending it to output channel, if `process` functions returns `skip` true.
+func RunWithSkip(input chan Entry, process func(e Entry) (Entry, bool)) chan Entry {
+	out := make(chan Entry)
+	go func() {
+		defer close(out)
+		for e := range input {
+			ee, skip := process(e)
+			if skip {
+				continue
+			}
+			out <- ee
+		}
+	}()
+
+	return out
+}
+
+// RunWithSkiporSendMany same as RunWithSkip, except it can either skip sending it to output channel, if `process` functions returns `skip` true. Or send many entries.
+func RunWithSkipOrSendMany(input chan Entry, process func(e Entry) ([]Entry, bool)) chan Entry {
+	out := make(chan Entry)
+	go func() {
+		defer close(out)
+		for e := range input {
+			results, skip := process(e)
+			if skip {
+				continue
+			}
+			for _, result := range results {
+				out <- result
+			}
+		}
+	}()
+
 	return out
 }
 
@@ -133,6 +176,7 @@ func (p *Pipeline) Wrap(next api.EntryHandler) api.EntryHandler {
 	return api.NewEntryHandler(handlerIn, func() {
 		once.Do(func() { close(handlerIn) })
 		wg.Wait()
+		p.Cleanup()
 	})
 }
 

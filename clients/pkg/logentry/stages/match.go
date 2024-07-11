@@ -1,15 +1,14 @@
 package stages
 
 import (
-	"github.com/prometheus/prometheus/model/labels"
-
 	"github.com/go-kit/log"
 	"github.com/mitchellh/mapstructure"
 	"github.com/pkg/errors"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/common/model"
+	"github.com/prometheus/prometheus/model/labels"
 
-	"github.com/grafana/loki/clients/pkg/logentry/logql"
+	"github.com/grafana/loki/v3/clients/pkg/logentry/logql"
 )
 
 const (
@@ -206,4 +205,9 @@ func (m *matcherStage) processLogQL(e Entry) (Entry, bool) {
 // Name implements Stage
 func (m *matcherStage) Name() string {
 	return StageTypeMatch
+}
+
+// Cleanup implements Stage.
+func (*matcherStage) Cleanup() {
+	// no-op
 }

@@ -8,6 +8,7 @@ import (
 	"github.com/grafana/loki/operator/internal/external/k8s"
 	"k8s.io/apimachinery/pkg/api/meta"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 )
@@ -52,18 +53,45 @@ type FakeClient struct {
 	deleteAllOfReturnsOnCall map[int]struct {
 		result1 error
 	}
-	GetStub        func(context.Context, types.NamespacedName, client.Object) error
+	GetStub        func(context.Context, types.NamespacedName, client.Object, ...client.GetOption) error
 	getMutex       sync.RWMutex
 	getArgsForCall []struct {
 		arg1 context.Context
 		arg2 types.NamespacedName
 		arg3 client.Object
+		arg4 []client.GetOption
 	}
 	getReturns struct {
 		result1 error
 	}
 	getReturnsOnCall map[int]struct {
 		result1 error
+	}
+	GroupVersionKindForStub        func(runtime.Object) (schema.GroupVersionKind, error)
+	groupVersionKindForMutex       sync.RWMutex
+	groupVersionKindForArgsForCall []struct {
+		arg1 runtime.Object
+	}
+	groupVersionKindForReturns struct {
+		result1 schema.GroupVersionKind
+		result2 error
+	}
+	groupVersionKindForReturnsOnCall map[int]struct {
+		result1 schema.GroupVersionKind
+		result2 error
+	}
+	IsObjectNamespacedStub        func(runtime.Object) (bool, error)
+	isObjectNamespacedMutex       sync.RWMutex
+	isObjectNamespacedArgsForCall []struct {
+		arg1 runtime.Object
+	}
+	isObjectNamespacedReturns struct {
+		result1 bool
+		result2 error
+	}
+	isObjectNamespacedReturnsOnCall map[int]struct {
+		result1 bool
+		result2 error
 	}
 	ListStub        func(context.Context, client.ObjectList, ...client.ListOption) error
 	listMutex       sync.RWMutex
@@ -112,15 +140,26 @@ type FakeClient struct {
 	schemeReturnsOnCall map[int]struct {
 		result1 *runtime.Scheme
 	}
-	StatusStub        func() client.StatusWriter
+	StatusStub        func() client.SubResourceWriter
 	statusMutex       sync.RWMutex
 	statusArgsForCall []struct {
 	}
 	statusReturns struct {
-		result1 client.StatusWriter
+		result1 client.SubResourceWriter
 	}
 	statusReturnsOnCall map[int]struct {
-		result1 client.StatusWriter
+		result1 client.SubResourceWriter
+	}
+	SubResourceStub        func(string) client.SubResourceClient
+	subResourceMutex       sync.RWMutex
+	subResourceArgsForCall []struct {
+		arg1 string
+	}
+	subResourceReturns struct {
+		result1 client.SubResourceClient
+	}
+	subResourceReturnsOnCall map[int]struct {
+		result1 client.SubResourceClient
 	}
 	UpdateStub        func(context.Context, client.Object, ...client.UpdateOption) error
 	updateMutex       sync.RWMutex
@@ -328,20 +367,21 @@ func (fake *FakeClient) DeleteAllOfReturnsOnCall(i int, result1 error) {
 	}{result1}
 }
 
-func (fake *FakeClient) Get(arg1 context.Context, arg2 types.NamespacedName, arg3 client.Object) error {
+func (fake *FakeClient) Get(arg1 context.Context, arg2 types.NamespacedName, arg3 client.Object, arg4 ...client.GetOption) error {
 	fake.getMutex.Lock()
 	ret, specificReturn := fake.getReturnsOnCall[len(fake.getArgsForCall)]
 	fake.getArgsForCall = append(fake.getArgsForCall, struct {
 		arg1 context.Context
 		arg2 types.NamespacedName
 		arg3 client.Object
-	}{arg1, arg2, arg3})
+		arg4 []client.GetOption
+	}{arg1, arg2, arg3, arg4})
 	stub := fake.GetStub
 	fakeReturns := fake.getReturns
-	fake.recordInvocation("Get", []interface{}{arg1, arg2, arg3})
+	fake.recordInvocation("Get", []interface{}{arg1, arg2, arg3, arg4})
 	fake.getMutex.Unlock()
 	if stub != nil {
-		return stub(arg1, arg2, arg3)
+		return stub(arg1, arg2, arg3, arg4...)
 	}
 	if specificReturn {
 		return ret.result1
@@ -355,17 +395,17 @@ func (fake *FakeClient) GetCallCount() int {
 	return len(fake.getArgsForCall)
 }
 
-func (fake *FakeClient) GetCalls(stub func(context.Context, types.NamespacedName, client.Object) error) {
+func (fake *FakeClient) GetCalls(stub func(context.Context, types.NamespacedName, client.Object, ...client.GetOption) error) {
 	fake.getMutex.Lock()
 	defer fake.getMutex.Unlock()
 	fake.GetStub = stub
 }
 
-func (fake *FakeClient) GetArgsForCall(i int) (context.Context, types.NamespacedName, client.Object) {
+func (fake *FakeClient) GetArgsForCall(i int) (context.Context, types.NamespacedName, client.Object, []client.GetOption) {
 	fake.getMutex.RLock()
 	defer fake.getMutex.RUnlock()
 	argsForCall := fake.getArgsForCall[i]
-	return argsForCall.arg1, argsForCall.arg2, argsForCall.arg3
+	return argsForCall.arg1, argsForCall.arg2, argsForCall.arg3, argsForCall.arg4
 }
 
 func (fake *FakeClient) GetReturns(result1 error) {
@@ -389,6 +429,134 @@ func (fake *FakeClient) GetReturnsOnCall(i int, result1 error) {
 	fake.getReturnsOnCall[i] = struct {
 		result1 error
 	}{result1}
+}
+
+func (fake *FakeClient) GroupVersionKindFor(arg1 runtime.Object) (schema.GroupVersionKind, error) {
+	fake.groupVersionKindForMutex.Lock()
+	ret, specificReturn := fake.groupVersionKindForReturnsOnCall[len(fake.groupVersionKindForArgsForCall)]
+	fake.groupVersionKindForArgsForCall = append(fake.groupVersionKindForArgsForCall, struct {
+		arg1 runtime.Object
+	}{arg1})
+	stub := fake.GroupVersionKindForStub
+	fakeReturns := fake.groupVersionKindForReturns
+	fake.recordInvocation("GroupVersionKindFor", []interface{}{arg1})
+	fake.groupVersionKindForMutex.Unlock()
+	if stub != nil {
+		return stub(arg1)
+	}
+	if specificReturn {
+		return ret.result1, ret.result2
+	}
+	return fakeReturns.result1, fakeReturns.result2
+}
+
+func (fake *FakeClient) GroupVersionKindForCallCount() int {
+	fake.groupVersionKindForMutex.RLock()
+	defer fake.groupVersionKindForMutex.RUnlock()
+	return len(fake.groupVersionKindForArgsForCall)
+}
+
+func (fake *FakeClient) GroupVersionKindForCalls(stub func(runtime.Object) (schema.GroupVersionKind, error)) {
+	fake.groupVersionKindForMutex.Lock()
+	defer fake.groupVersionKindForMutex.Unlock()
+	fake.GroupVersionKindForStub = stub
+}
+
+func (fake *FakeClient) GroupVersionKindForArgsForCall(i int) runtime.Object {
+	fake.groupVersionKindForMutex.RLock()
+	defer fake.groupVersionKindForMutex.RUnlock()
+	argsForCall := fake.groupVersionKindForArgsForCall[i]
+	return argsForCall.arg1
+}
+
+func (fake *FakeClient) GroupVersionKindForReturns(result1 schema.GroupVersionKind, result2 error) {
+	fake.groupVersionKindForMutex.Lock()
+	defer fake.groupVersionKindForMutex.Unlock()
+	fake.GroupVersionKindForStub = nil
+	fake.groupVersionKindForReturns = struct {
+		result1 schema.GroupVersionKind
+		result2 error
+	}{result1, result2}
+}
+
+func (fake *FakeClient) GroupVersionKindForReturnsOnCall(i int, result1 schema.GroupVersionKind, result2 error) {
+	fake.groupVersionKindForMutex.Lock()
+	defer fake.groupVersionKindForMutex.Unlock()
+	fake.GroupVersionKindForStub = nil
+	if fake.groupVersionKindForReturnsOnCall == nil {
+		fake.groupVersionKindForReturnsOnCall = make(map[int]struct {
+			result1 schema.GroupVersionKind
+			result2 error
+		})
+	}
+	fake.groupVersionKindForReturnsOnCall[i] = struct {
+		result1 schema.GroupVersionKind
+		result2 error
+	}{result1, result2}
+}
+
+func (fake *FakeClient) IsObjectNamespaced(arg1 runtime.Object) (bool, error) {
+	fake.isObjectNamespacedMutex.Lock()
+	ret, specificReturn := fake.isObjectNamespacedReturnsOnCall[len(fake.isObjectNamespacedArgsForCall)]
+	fake.isObjectNamespacedArgsForCall = append(fake.isObjectNamespacedArgsForCall, struct {
+		arg1 runtime.Object
+	}{arg1})
+	stub := fake.IsObjectNamespacedStub
+	fakeReturns := fake.isObjectNamespacedReturns
+	fake.recordInvocation("IsObjectNamespaced", []interface{}{arg1})
+	fake.isObjectNamespacedMutex.Unlock()
+	if stub != nil {
+		return stub(arg1)
+	}
+	if specificReturn {
+		return ret.result1, ret.result2
+	}
+	return fakeReturns.result1, fakeReturns.result2
+}
+
+func (fake *FakeClient) IsObjectNamespacedCallCount() int {
+	fake.isObjectNamespacedMutex.RLock()
+	defer fake.isObjectNamespacedMutex.RUnlock()
+	return len(fake.isObjectNamespacedArgsForCall)
+}
+
+func (fake *FakeClient) IsObjectNamespacedCalls(stub func(runtime.Object) (bool, error)) {
+	fake.isObjectNamespacedMutex.Lock()
+	defer fake.isObjectNamespacedMutex.Unlock()
+	fake.IsObjectNamespacedStub = stub
+}
+
+func (fake *FakeClient) IsObjectNamespacedArgsForCall(i int) runtime.Object {
+	fake.isObjectNamespacedMutex.RLock()
+	defer fake.isObjectNamespacedMutex.RUnlock()
+	argsForCall := fake.isObjectNamespacedArgsForCall[i]
+	return argsForCall.arg1
+}
+
+func (fake *FakeClient) IsObjectNamespacedReturns(result1 bool, result2 error) {
+	fake.isObjectNamespacedMutex.Lock()
+	defer fake.isObjectNamespacedMutex.Unlock()
+	fake.IsObjectNamespacedStub = nil
+	fake.isObjectNamespacedReturns = struct {
+		result1 bool
+		result2 error
+	}{result1, result2}
+}
+
+func (fake *FakeClient) IsObjectNamespacedReturnsOnCall(i int, result1 bool, result2 error) {
+	fake.isObjectNamespacedMutex.Lock()
+	defer fake.isObjectNamespacedMutex.Unlock()
+	fake.IsObjectNamespacedStub = nil
+	if fake.isObjectNamespacedReturnsOnCall == nil {
+		fake.isObjectNamespacedReturnsOnCall = make(map[int]struct {
+			result1 bool
+			result2 error
+		})
+	}
+	fake.isObjectNamespacedReturnsOnCall[i] = struct {
+		result1 bool
+		result2 error
+	}{result1, result2}
 }
 
 func (fake *FakeClient) List(arg1 context.Context, arg2 client.ObjectList, arg3 ...client.ListOption) error {
@@ -624,7 +792,7 @@ func (fake *FakeClient) SchemeReturnsOnCall(i int, result1 *runtime.Scheme) {
 	}{result1}
 }
 
-func (fake *FakeClient) Status() client.StatusWriter {
+func (fake *FakeClient) Status() client.SubResourceWriter {
 	fake.statusMutex.Lock()
 	ret, specificReturn := fake.statusReturnsOnCall[len(fake.statusArgsForCall)]
 	fake.statusArgsForCall = append(fake.statusArgsForCall, struct {
@@ -648,32 +816,93 @@ func (fake *FakeClient) StatusCallCount() int {
 	return len(fake.statusArgsForCall)
 }
 
-func (fake *FakeClient) StatusCalls(stub func() client.StatusWriter) {
+func (fake *FakeClient) StatusCalls(stub func() client.SubResourceWriter) {
 	fake.statusMutex.Lock()
 	defer fake.statusMutex.Unlock()
 	fake.StatusStub = stub
 }
 
-func (fake *FakeClient) StatusReturns(result1 client.StatusWriter) {
+func (fake *FakeClient) StatusReturns(result1 client.SubResourceWriter) {
 	fake.statusMutex.Lock()
 	defer fake.statusMutex.Unlock()
 	fake.StatusStub = nil
 	fake.statusReturns = struct {
-		result1 client.StatusWriter
+		result1 client.SubResourceWriter
 	}{result1}
 }
 
-func (fake *FakeClient) StatusReturnsOnCall(i int, result1 client.StatusWriter) {
+func (fake *FakeClient) StatusReturnsOnCall(i int, result1 client.SubResourceWriter) {
 	fake.statusMutex.Lock()
 	defer fake.statusMutex.Unlock()
 	fake.StatusStub = nil
 	if fake.statusReturnsOnCall == nil {
 		fake.statusReturnsOnCall = make(map[int]struct {
-			result1 client.StatusWriter
+			result1 client.SubResourceWriter
 		})
 	}
 	fake.statusReturnsOnCall[i] = struct {
-		result1 client.StatusWriter
+		result1 client.SubResourceWriter
+	}{result1}
+}
+
+func (fake *FakeClient) SubResource(arg1 string) client.SubResourceClient {
+	fake.subResourceMutex.Lock()
+	ret, specificReturn := fake.subResourceReturnsOnCall[len(fake.subResourceArgsForCall)]
+	fake.subResourceArgsForCall = append(fake.subResourceArgsForCall, struct {
+		arg1 string
+	}{arg1})
+	stub := fake.SubResourceStub
+	fakeReturns := fake.subResourceReturns
+	fake.recordInvocation("SubResource", []interface{}{arg1})
+	fake.subResourceMutex.Unlock()
+	if stub != nil {
+		return stub(arg1)
+	}
+	if specificReturn {
+		return ret.result1
+	}
+	return fakeReturns.result1
+}
+
+func (fake *FakeClient) SubResourceCallCount() int {
+	fake.subResourceMutex.RLock()
+	defer fake.subResourceMutex.RUnlock()
+	return len(fake.subResourceArgsForCall)
+}
+
+func (fake *FakeClient) SubResourceCalls(stub func(string) client.SubResourceClient) {
+	fake.subResourceMutex.Lock()
+	defer fake.subResourceMutex.Unlock()
+	fake.SubResourceStub = stub
+}
+
+func (fake *FakeClient) SubResourceArgsForCall(i int) string {
+	fake.subResourceMutex.RLock()
+	defer fake.subResourceMutex.RUnlock()
+	argsForCall := fake.subResourceArgsForCall[i]
+	return argsForCall.arg1
+}
+
+func (fake *FakeClient) SubResourceReturns(result1 client.SubResourceClient) {
+	fake.subResourceMutex.Lock()
+	defer fake.subResourceMutex.Unlock()
+	fake.SubResourceStub = nil
+	fake.subResourceReturns = struct {
+		result1 client.SubResourceClient
+	}{result1}
+}
+
+func (fake *FakeClient) SubResourceReturnsOnCall(i int, result1 client.SubResourceClient) {
+	fake.subResourceMutex.Lock()
+	defer fake.subResourceMutex.Unlock()
+	fake.SubResourceStub = nil
+	if fake.subResourceReturnsOnCall == nil {
+		fake.subResourceReturnsOnCall = make(map[int]struct {
+			result1 client.SubResourceClient
+		})
+	}
+	fake.subResourceReturnsOnCall[i] = struct {
+		result1 client.SubResourceClient
 	}{result1}
 }
 
@@ -751,6 +980,10 @@ func (fake *FakeClient) Invocations() map[string][][]interface{} {
 	defer fake.deleteAllOfMutex.RUnlock()
 	fake.getMutex.RLock()
 	defer fake.getMutex.RUnlock()
+	fake.groupVersionKindForMutex.RLock()
+	defer fake.groupVersionKindForMutex.RUnlock()
+	fake.isObjectNamespacedMutex.RLock()
+	defer fake.isObjectNamespacedMutex.RUnlock()
 	fake.listMutex.RLock()
 	defer fake.listMutex.RUnlock()
 	fake.patchMutex.RLock()
@@ -761,6 +994,8 @@ func (fake *FakeClient) Invocations() map[string][][]interface{} {
 	defer fake.schemeMutex.RUnlock()
 	fake.statusMutex.RLock()
 	defer fake.statusMutex.RUnlock()
+	fake.subResourceMutex.RLock()
+	defer fake.subResourceMutex.RUnlock()
 	fake.updateMutex.RLock()
 	defer fake.updateMutex.RUnlock()
 	copiedInvocations := map[string][][]interface{}{}

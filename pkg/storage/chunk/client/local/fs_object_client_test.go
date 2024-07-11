@@ -3,7 +3,6 @@ package local
 import (
 	"bytes"
 	"context"
-	"io/ioutil"
 	"os"
 	"path"
 	"path/filepath"
@@ -13,7 +12,7 @@ import (
 
 	"github.com/stretchr/testify/require"
 
-	"github.com/grafana/loki/pkg/storage/chunk/client/util"
+	"github.com/grafana/loki/v3/pkg/storage/chunk/client/util"
 )
 
 func TestFSObjectClient_DeleteChunksBefore(t *testing.T) {
@@ -41,12 +40,12 @@ func TestFSObjectClient_DeleteChunksBefore(t *testing.T) {
 	require.NoError(t, f.Close())
 
 	// Verify whether all files are created
-	files, _ := ioutil.ReadDir(".")
+	files, _ := os.ReadDir(".")
 	require.Equal(t, 2, len(files), "Number of files should be 2")
 
 	// No files should be deleted, since all of them are not much older
 	require.NoError(t, bucketClient.DeleteChunksBefore(context.Background(), time.Now().Add(-deleteFilesOlderThan)))
-	files, _ = ioutil.ReadDir(".")
+	files, _ = os.ReadDir(".")
 	require.Equal(t, 2, len(files), "Number of files should be 2")
 
 	// Changing mtime of file1 to make it look older
@@ -54,11 +53,11 @@ func TestFSObjectClient_DeleteChunksBefore(t *testing.T) {
 	require.NoError(t, bucketClient.DeleteChunksBefore(context.Background(), time.Now().Add(-deleteFilesOlderThan)))
 
 	// Verifying whether older file got deleted
-	files, _ = ioutil.ReadDir(".")
+	files, _ = os.ReadDir(".")
 	require.Equal(t, 1, len(files), "Number of files should be 1 after enforcing retention")
 }
 
-func TestFSObjectClient_List(t *testing.T) {
+func TestFSObjectClient_List_and_ObjectExists(t *testing.T) {
 	fsObjectsDir := t.TempDir()
 
 	bucketClient, err := NewFSObjectClient(FSConfig{
@@ -153,6 +152,10 @@ func TestFSObjectClient_List(t *testing.T) {
 	require.Len(t, storageObjects, 1)
 	require.Equal(t, "outer-file1", storageObjects[0].Key)
 	require.Empty(t, commonPrefixes)
+
+	ok, err := bucketClient.ObjectExists(context.Background(), "outer-file2")
+	require.NoError(t, err)
+	require.True(t, ok)
 }
 
 func TestFSObjectClient_DeleteObject(t *testing.T) {

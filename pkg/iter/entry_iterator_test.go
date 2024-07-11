@@ -12,8 +12,8 @@ import (
 	"github.com/stretchr/testify/require"
 	"go.uber.org/atomic"
 
-	"github.com/grafana/loki/pkg/logproto"
-	"github.com/grafana/loki/pkg/logqlmodel/stats"
+	"github.com/grafana/loki/v3/pkg/logproto"
+	"github.com/grafana/loki/v3/pkg/logqlmodel/stats"
 )
 
 const (
@@ -165,8 +165,8 @@ func TestMergeIteratorPrefetch(t *testing.T) {
 	type tester func(t *testing.T, i HeapIterator)
 
 	tests := map[string]tester{
-		"prefetch on Len() when called as first method": func(t *testing.T, i HeapIterator) {
-			assert.Equal(t, 2, i.Len())
+		"prefetch on IsEmpty() when called as first method": func(t *testing.T, i HeapIterator) {
+			assert.Equal(t, false, i.IsEmpty())
 		},
 		"prefetch on Peek() when called as first method": func(t *testing.T, i HeapIterator) {
 			assert.Equal(t, time.Unix(0, 0), i.Peek())
@@ -520,8 +520,8 @@ func Test_DuplicateCount(t *testing.T) {
 		{
 			"replication 2 b",
 			[]EntryIterator{
-				NewStreamIterator(stream),
-				NewStreamIterator(stream),
+				mustReverseStreamIterator(NewStreamIterator(stream)),
+				mustReverseStreamIterator(NewStreamIterator(stream)),
 			},
 			logproto.BACKWARD,
 			3,
@@ -556,9 +556,9 @@ func Test_DuplicateCount(t *testing.T) {
 		{
 			"replication 3 b",
 			[]EntryIterator{
-				NewStreamIterator(stream),
-				NewStreamIterator(stream),
-				NewStreamIterator(stream),
+				mustReverseStreamIterator(NewStreamIterator(stream)),
+				mustReverseStreamIterator(NewStreamIterator(stream)),
+				mustReverseStreamIterator(NewStreamIterator(stream)),
 				NewStreamIterator(logproto.Stream{
 					Entries: []logproto.Entry{
 						{
@@ -606,9 +606,10 @@ func Test_DuplicateCount(t *testing.T) {
 			_, ctx := stats.NewContext(context.Background())
 			it := NewMergeEntryIterator(ctx, test.iters, test.direction)
 			defer it.Close()
+			//nolint:revive
 			for it.Next() {
 			}
-			require.Equal(t, test.expectedDuplicates, stats.FromContext(ctx).Result(0, 0).TotalDuplicates())
+			require.Equal(t, test.expectedDuplicates, stats.FromContext(ctx).Result(0, 0, 0).TotalDuplicates())
 		})
 	}
 }
@@ -724,6 +725,25 @@ func BenchmarkSortIterator(b *testing.B) {
 			b.StopTimer()
 			var itrs []EntryIterator
 			for i := 0; i < streamsCount; i++ {
+				itrs = append(itrs, NewStreamIterator(streams[i]))
+			}
+			b.StartTimer()
+			it := NewMergeEntryIterator(ctx, itrs, logproto.BACKWARD)
+			for it.Next() {
+				it.Entry()
+			}
+			it.Close()
+		}
+	})
+
+	b.Run("merge sort dedupe", func(b *testing.B) {
+		b.ReportAllocs()
+		b.ResetTimer()
+		for i := 0; i < b.N; i++ {
+			b.StopTimer()
+			var itrs []EntryIterator
+			for i := 0; i < streamsCount; i++ {
+				itrs = append(itrs, NewStreamIterator(streams[i]))
 				itrs = append(itrs, NewStreamIterator(streams[i]))
 			}
 			b.StartTimer()
@@ -886,15 +906,21 @@ func TestDedupeMergeEntryIterator(t *testing.T) {
 			}),
 		}, logproto.FORWARD)
 	require.True(t, it.Next())
-	require.Equal(t, "0", it.Entry().Line)
+	lines := []string{it.Entry().Line}
 	require.Equal(t, time.Unix(1, 0), it.Entry().Timestamp)
 	require.True(t, it.Next())
-	require.Equal(t, "2", it.Entry().Line)
+	lines = append(lines, it.Entry().Line)
 	require.Equal(t, time.Unix(1, 0), it.Entry().Timestamp)
 	require.True(t, it.Next())
-	require.Equal(t, "1", it.Entry().Line)
+	lines = append(lines, it.Entry().Line)
 	require.Equal(t, time.Unix(1, 0), it.Entry().Timestamp)
 	require.True(t, it.Next())
-	require.Equal(t, "3", it.Entry().Line)
+	lines = append(lines, it.Entry().Line)
 	require.Equal(t, time.Unix(2, 0), it.Entry().Timestamp)
+	// Two orderings are consistent with the inputs.
+	if lines[0] == "1" {
+		require.Equal(t, []string{"1", "0", "2", "3"}, lines)
+	} else {
+		require.Equal(t, []string{"0", "2", "1", "3"}, lines)
+	}
 }

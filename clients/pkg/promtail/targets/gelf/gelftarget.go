@@ -9,16 +9,16 @@ import (
 
 	"github.com/go-kit/log"
 	"github.com/go-kit/log/level"
+	"github.com/grafana/go-gelf/v2/gelf"
 	"github.com/prometheus/common/model"
 	"github.com/prometheus/prometheus/model/labels"
 	"github.com/prometheus/prometheus/model/relabel"
-	"gopkg.in/Graylog2/go-gelf.v2/gelf"
 
-	"github.com/grafana/loki/clients/pkg/promtail/api"
-	"github.com/grafana/loki/clients/pkg/promtail/scrapeconfig"
-	"github.com/grafana/loki/clients/pkg/promtail/targets/target"
+	"github.com/grafana/loki/v3/clients/pkg/promtail/api"
+	"github.com/grafana/loki/v3/clients/pkg/promtail/scrapeconfig"
+	"github.com/grafana/loki/v3/clients/pkg/promtail/targets/target"
 
-	"github.com/grafana/loki/pkg/logproto"
+	"github.com/grafana/loki/v3/pkg/logproto"
 )
 
 // SeverityLevels maps severity levels to severity string levels.
@@ -122,7 +122,7 @@ func (t *Target) handleMessage(msg *gelf.Message) {
 	lb.Set("__gelf_message_version", msg.Version)
 	lb.Set("__gelf_message_facility", msg.Facility)
 
-	processed := relabel.Process(lb.Labels(), t.relabelConfig...)
+	processed, _ := relabel.Process(lb.Labels(), t.relabelConfig...)
 
 	filtered := make(model.LabelSet)
 	for _, lbl := range processed {

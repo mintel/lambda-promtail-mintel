@@ -10,15 +10,18 @@ import (
 	"time"
 
 	"cloud.google.com/go/storage"
+	"github.com/grafana/dskit/flagext"
 	"github.com/pkg/errors"
 	"github.com/prometheus/client_golang/prometheus"
+	"google.golang.org/api/googleapi"
 	"google.golang.org/api/iterator"
 	"google.golang.org/api/option"
 	google_http "google.golang.org/api/transport/http"
+	amnet "k8s.io/apimachinery/pkg/util/net"
 
-	"github.com/grafana/loki/pkg/storage/chunk/client"
-	"github.com/grafana/loki/pkg/storage/chunk/client/hedging"
-	"github.com/grafana/loki/pkg/storage/chunk/client/util"
+	"github.com/grafana/loki/v3/pkg/storage/chunk/client"
+	"github.com/grafana/loki/v3/pkg/storage/chunk/client/hedging"
+	"github.com/grafana/loki/v3/pkg/storage/chunk/client/util"
 )
 
 type ClientFactory func(ctx context.Context, opts ...option.ClientOption) (*storage.Client, error)
@@ -32,11 +35,15 @@ type GCSObjectClient struct {
 
 // GCSConfig is config for the GCS Chunk Client.
 type GCSConfig struct {
-	BucketName       string        `yaml:"bucket_name"`
-	ChunkBufferSize  int           `yaml:"chunk_buffer_size"`
-	RequestTimeout   time.Duration `yaml:"request_timeout"`
-	EnableOpenCensus bool          `yaml:"enable_opencensus"`
-	EnableHTTP2      bool          `yaml:"enable_http2"`
+	BucketName       string         `yaml:"bucket_name"`
+	ServiceAccount   flagext.Secret `yaml:"service_account"`
+	ChunkBufferSize  int            `yaml:"chunk_buffer_size"`
+	RequestTimeout   time.Duration  `yaml:"request_timeout"`
+	EnableOpenCensus bool           `yaml:"enable_opencensus"`
+	EnableHTTP2      bool           `yaml:"enable_http2"`
+
+	// TODO(dannyk): remove this and disable GCS client retries; move a layer higher instead.
+	EnableRetries bool `yaml:"enable_retries"`
 
 	Insecure bool `yaml:"-"`
 }
@@ -49,10 +56,12 @@ func (cfg *GCSConfig) RegisterFlags(f *flag.FlagSet) {
 // RegisterFlagsWithPrefix registers flags with prefix.
 func (cfg *GCSConfig) RegisterFlagsWithPrefix(prefix string, f *flag.FlagSet) {
 	f.StringVar(&cfg.BucketName, prefix+"gcs.bucketname", "", "Name of GCS bucket. Please refer to https://cloud.google.com/docs/authentication/production for more information about how to configure authentication.")
+	f.Var(&cfg.ServiceAccount, prefix+"gcs.service-account", "Service account key content in JSON format, refer to https://cloud.google.com/iam/docs/creating-managing-service-account-keys for creation.")
 	f.IntVar(&cfg.ChunkBufferSize, prefix+"gcs.chunk-buffer-size", 0, "The size of the buffer that GCS client for each PUT request. 0 to disable buffering.")
 	f.DurationVar(&cfg.RequestTimeout, prefix+"gcs.request-timeout", 0, "The duration after which the requests to GCS should be timed out.")
 	f.BoolVar(&cfg.EnableOpenCensus, prefix+"gcs.enable-opencensus", true, "Enable OpenCensus (OC) instrumentation for all requests.")
 	f.BoolVar(&cfg.EnableHTTP2, prefix+"gcs.enable-http2", true, "Enable HTTP2 connections.")
+	f.BoolVar(&cfg.EnableRetries, prefix+"gcs.enable-retries", true, "Enable automatic retries of failed idempotent requests.")
 }
 
 // NewGCSObjectClient makes a new chunk.Client that writes chunks to GCS.
@@ -81,7 +90,7 @@ func newGCSObjectClient(ctx context.Context, cfg GCSConfig, hedgingCfg hedging.C
 
 func newBucketHandle(ctx context.Context, cfg GCSConfig, hedgingCfg hedging.Config, enableHTTP2, hedging bool, clientFactory ClientFactory) (*storage.BucketHandle, error) {
 	var opts []option.ClientOption
-	transport, err := gcsTransport(ctx, storage.ScopeReadWrite, cfg.Insecure, enableHTTP2)
+	transport, err := gcsTransport(ctx, storage.ScopeReadWrite, cfg.Insecure, enableHTTP2, cfg.ServiceAccount)
 	if err != nil {
 		return nil, err
 	}
@@ -104,10 +113,25 @@ func newBucketHandle(ctx context.Context, cfg GCSConfig, hedgingCfg hedging.Conf
 		return nil, err
 	}
 
-	return client.Bucket(cfg.BucketName), nil
+	bucket := client.Bucket(cfg.BucketName)
+
+	if !cfg.EnableRetries {
+		bucket = bucket.Retryer(storage.WithPolicy(storage.RetryNever))
+	}
+
+	return bucket, nil
 }
 
 func (s *GCSObjectClient) Stop() {
+}
+
+func (s *GCSObjectClient) ObjectExists(ctx context.Context, objectKey string) (bool, error) {
+	_, err := s.getsBuckets.Object(objectKey).Attrs(ctx)
+	if err != nil {
+		return false, err
+	}
+
+	return true, nil
 }
 
 // GetObject returns a reader and the size for the specified object key from the configured GCS bucket.
@@ -212,7 +236,67 @@ func (s *GCSObjectClient) IsObjectNotFoundErr(err error) bool {
 	return errors.Is(err, storage.ErrObjectNotExist)
 }
 
-func gcsTransport(ctx context.Context, scope string, insecure bool, http2 bool) (http.RoundTripper, error) {
+func isTimeoutError(err error) bool {
+	var netErr net.Error
+	return errors.As(err, &netErr) && netErr.Timeout()
+}
+
+func isContextErr(err error) bool {
+	return errors.Is(err, context.DeadlineExceeded) ||
+		errors.Is(err, context.Canceled)
+}
+
+// IsStorageTimeoutErr returns true if error means that object cannot be retrieved right now due to server-side timeouts.
+func (s *GCSObjectClient) IsStorageTimeoutErr(err error) bool {
+	// TODO(dannyk): move these out to be generic
+	// context errors are all client-side
+	if isContextErr(err) {
+		return false
+	}
+
+	// connection misconfiguration, or writing on a closed connection
+	// do NOT retry; this is not a server-side issue
+	if errors.Is(err, net.ErrClosed) || amnet.IsConnectionRefused(err) {
+		return false
+	}
+
+	// this is a server-side timeout
+	if isTimeoutError(err) {
+		return true
+	}
+
+	// connection closed (closed before established) or reset (closed after established)
+	// this is a server-side issue
+	if errors.Is(err, io.EOF) || amnet.IsConnectionReset(err) {
+		return true
+	}
+
+	if gerr, ok := err.(*googleapi.Error); ok {
+		// https://cloud.google.com/storage/docs/retry-strategy
+		return gerr.Code == http.StatusRequestTimeout ||
+			gerr.Code == http.StatusGatewayTimeout
+	}
+
+	return false
+}
+
+// IsStorageThrottledErr returns true if error means that object cannot be retrieved right now due to throttling.
+func (s *GCSObjectClient) IsStorageThrottledErr(err error) bool {
+	if gerr, ok := err.(*googleapi.Error); ok {
+		// https://cloud.google.com/storage/docs/retry-strategy
+		return gerr.Code == http.StatusTooManyRequests ||
+			(gerr.Code/100 == 5) // all 5xx errors are retryable
+	}
+
+	return false
+}
+
+// IsRetryableErr returns true if the request failed due to some retryable server-side scenario
+func (s *GCSObjectClient) IsRetryableErr(err error) bool {
+	return s.IsStorageTimeoutErr(err) || s.IsStorageThrottledErr(err)
+}
+
+func gcsTransport(ctx context.Context, scope string, insecure bool, http2 bool, serviceAccount flagext.Secret) (http.RoundTripper, error) {
 	customTransport := &http.Transport{
 		Proxy: http.ProxyFromEnvironment,
 		DialContext: (&net.Dialer{
@@ -235,8 +319,10 @@ func gcsTransport(ctx context.Context, scope string, insecure bool, http2 bool) 
 	transportOptions := []option.ClientOption{option.WithScopes(scope)}
 	if insecure {
 		customTransport.TLSClientConfig = &tls.Config{InsecureSkipVerify: true}
-		// When using `insecure` (testing only), we add a fake API key as well to skip credential chain lookups.
-		transportOptions = append(transportOptions, option.WithAPIKey("insecure"))
+		transportOptions = append(transportOptions, option.WithoutAuthentication())
+	}
+	if serviceAccount.String() != "" {
+		transportOptions = append(transportOptions, option.WithCredentialsJSON([]byte(serviceAccount.String())))
 	}
 	return google_http.NewTransport(ctx, customTransport, transportOptions...)
 }

@@ -27,6 +27,16 @@ type moduleService struct {
 	startDeps, stopDeps func(string) map[string]services.Service
 }
 
+type delegatedNamedService struct {
+	services.Service
+
+	delegate services.NamedService
+}
+
+func (n delegatedNamedService) ServiceName() string {
+	return n.delegate.ServiceName()
+}
+
 // NewModuleService wraps a module service, and makes sure that dependencies are started/stopped before module service starts or stops.
 // If any dependency fails to start, this service fails as well.
 // On stop, errors from failed dependencies are ignored.
@@ -40,6 +50,14 @@ func NewModuleService(name string, logger log.Logger, service services.Service, 
 	}
 
 	w.Service = services.NewBasicService(w.start, w.run, w.stop)
+
+	if namedService, isNamed := service.(services.NamedService); isNamed {
+		// return a value that implements services.NamedService only if the wrapped service implements services.NamedService
+		return delegatedNamedService{
+			Service:  w,
+			delegate: namedService,
+		}
+	}
 	return w
 }
 
@@ -61,13 +79,19 @@ func (w *moduleService) start(serviceContext context.Context) error {
 
 	// we don't want to let this service to stop until all dependant services are stopped,
 	// so we use independent context here
-	level.Info(w.logger).Log("msg", "initialising", "module", w.name)
+	level.Info(w.logger).Log("msg", "starting", "module", w.name)
 	err := w.service.StartAsync(context.Background())
 	if err != nil {
 		return errors.Wrapf(err, "error starting module: %s", w.name)
 	}
 
-	return w.service.AwaitRunning(serviceContext)
+	err = w.service.AwaitRunning(serviceContext)
+	if err != nil {
+		// Make sure that underlying service is stopped before returning
+		// (e.g. in case of context cancellation, AwaitRunning returns early, but service may still be starting).
+		_ = services.StopAndAwaitTerminated(context.Background(), w.service)
+	}
+	return errors.Wrapf(err, "starting module %s", w.name)
 }
 
 func (w *moduleService) run(serviceContext context.Context) error {

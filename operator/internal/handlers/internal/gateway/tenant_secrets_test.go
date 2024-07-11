@@ -2,143 +2,200 @@ package gateway
 
 import (
 	"context"
+	"strings"
 	"testing"
 
 	"github.com/stretchr/testify/require"
-
-	lokiv1beta1 "github.com/grafana/loki/operator/api/v1beta1"
-	"github.com/grafana/loki/operator/internal/external/k8s/k8sfakes"
-	"github.com/grafana/loki/operator/internal/manifests"
-
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
-	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+
+	lokiv1 "github.com/grafana/loki/operator/apis/loki/v1"
+	"github.com/grafana/loki/operator/internal/external/k8s/k8sfakes"
+	"github.com/grafana/loki/operator/internal/manifests"
 )
 
-func TestGetTenantSecrets_StaticMode(t *testing.T) {
-	k := &k8sfakes.FakeClient{}
-	r := ctrl.Request{
-		NamespacedName: types.NamespacedName{
-			Name:      "my-stack",
-			Namespace: "some-ns",
-		},
-	}
-
-	s := &lokiv1beta1.LokiStack{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:      "mystack",
-			Namespace: "some-ns",
-		},
-		Spec: lokiv1beta1.LokiStackSpec{
-			Tenants: &lokiv1beta1.TenantsSpec{
-				Mode: lokiv1beta1.Static,
-				Authentication: []lokiv1beta1.AuthenticationSpec{
+func TestGetTenantSecrets(t *testing.T) {
+	for _, mode := range []lokiv1.ModeType{lokiv1.Static, lokiv1.Dynamic} {
+		for _, tc := range []struct {
+			name      string
+			authNSpec []lokiv1.AuthenticationSpec
+			object    client.Object
+			expected  []*manifests.TenantSecrets
+		}{
+			{
+				name: "oidc",
+				authNSpec: []lokiv1.AuthenticationSpec{
 					{
 						TenantName: "test",
 						TenantID:   "test",
-						OIDC: &lokiv1beta1.OIDCSpec{
-							Secret: &lokiv1beta1.TenantSecretSpec{
+						OIDC: &lokiv1.OIDCSpec{
+							Secret: &lokiv1.TenantSecretSpec{
 								Name: "test",
 							},
 						},
 					},
 				},
+				object: &corev1.Secret{
+					ObjectMeta: metav1.ObjectMeta{
+						Name:      "test",
+						Namespace: "some-ns",
+					},
+					Data: map[string][]byte{
+						"clientID":     []byte("test"),
+						"clientSecret": []byte("test"),
+					},
+				},
+				expected: []*manifests.TenantSecrets{
+					{
+						TenantName: "test",
+						OIDCSecret: &manifests.OIDCSecret{
+							ClientID:     "test",
+							ClientSecret: "test",
+						},
+					},
+				},
 			},
-		},
-	}
+			{
+				name: "mTLS",
+				authNSpec: []lokiv1.AuthenticationSpec{
+					{
+						TenantName: "test",
+						TenantID:   "test",
+						MTLS: &lokiv1.MTLSSpec{
+							CA: &lokiv1.CASpec{
+								CA:    "test",
+								CAKey: "special-ca.crt",
+							},
+						},
+					},
+				},
+				object: &corev1.ConfigMap{
+					ObjectMeta: metav1.ObjectMeta{
+						Name:      "test",
+						Namespace: "some-ns",
+					},
+					Data: map[string]string{
+						"special-ca.crt": "my-specila-ca",
+					},
+				},
+				expected: []*manifests.TenantSecrets{
+					{
+						TenantName: "test",
+						MTLSSecret: &manifests.MTLSSecret{
+							CAPath: "/var/run/tenants-ca/test/special-ca.crt",
+						},
+					},
+				},
+			},
+		} {
+			t.Run(strings.Join([]string{string(mode), tc.name}, "_"), func(t *testing.T) {
+				k := &k8sfakes.FakeClient{}
+				s := &lokiv1.LokiStack{
+					ObjectMeta: metav1.ObjectMeta{
+						Name:      "mystack",
+						Namespace: "some-ns",
+					},
+					Spec: lokiv1.LokiStackSpec{
+						Tenants: &lokiv1.TenantsSpec{
+							Mode:           mode,
+							Authentication: tc.authNSpec,
+						},
+					},
+				}
 
-	k.GetStub = func(_ context.Context, name types.NamespacedName, object client.Object) error {
-		if name.Name == "test" && name.Namespace == "some-ns" {
-			k.SetClientObject(object, &corev1.Secret{
-				ObjectMeta: metav1.ObjectMeta{
-					Name:      "test",
-					Namespace: "some-ns",
-				},
-				Data: map[string][]byte{
-					"clientID":     []byte("test"),
-					"clientSecret": []byte("test"),
-					"issuerCAPath": []byte("/path/to/ca/file"),
-				},
+				k.GetStub = func(_ context.Context, name types.NamespacedName, object client.Object, _ ...client.GetOption) error {
+					if name.Name == "test" && name.Namespace == "some-ns" {
+						k.SetClientObject(object, tc.object)
+					}
+					return nil
+				}
+				ts, err := getTenantSecrets(context.TODO(), k, s)
+				require.NoError(t, err)
+				require.ElementsMatch(t, ts, tc.expected)
 			})
 		}
-		return nil
 	}
-
-	ts, err := GetTenantSecrets(context.TODO(), k, r, s)
-	require.NoError(t, err)
-
-	expected := []*manifests.TenantSecrets{
-		{
-			TenantName:   "test",
-			ClientID:     "test",
-			ClientSecret: "test",
-			IssuerCAPath: "/path/to/ca/file",
-		},
-	}
-	require.ElementsMatch(t, ts, expected)
 }
 
-func TestGetTenantSecrets_DynamicMode(t *testing.T) {
-	k := &k8sfakes.FakeClient{}
-	r := ctrl.Request{
-		NamespacedName: types.NamespacedName{
-			Name:      "my-stack",
-			Namespace: "some-ns",
-		},
+func TestExtractOIDCSecret(t *testing.T) {
+	type test struct {
+		name       string
+		tenantName string
+		secret     *corev1.Secret
+		wantErr    bool
 	}
-
-	s := &lokiv1beta1.LokiStack{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:      "mystack",
-			Namespace: "some-ns",
+	table := []test{
+		{
+			name:       "missing clientID",
+			tenantName: "tenant-a",
+			secret:     &corev1.Secret{},
+			wantErr:    true,
 		},
-		Spec: lokiv1beta1.LokiStackSpec{
-			Tenants: &lokiv1beta1.TenantsSpec{
-				Mode: lokiv1beta1.Dynamic,
-				Authentication: []lokiv1beta1.AuthenticationSpec{
-					{
-						TenantName: "test",
-						TenantID:   "test",
-						OIDC: &lokiv1beta1.OIDCSpec{
-							Secret: &lokiv1beta1.TenantSecretSpec{
-								Name: "test",
-							},
-						},
-					},
+		{
+			name:       "all set",
+			tenantName: "tenant-a",
+			secret: &corev1.Secret{
+				Data: map[string][]byte{
+					"clientID":     []byte("test"),
+					"clientSecret": []byte("test"),
 				},
 			},
 		},
 	}
+	for _, tst := range table {
+		tst := tst
+		t.Run(tst.name, func(t *testing.T) {
+			t.Parallel()
 
-	k.GetStub = func(_ context.Context, name types.NamespacedName, object client.Object) error {
-		if name.Name == "test" && name.Namespace == "some-ns" {
-			k.SetClientObject(object, &corev1.Secret{
-				ObjectMeta: metav1.ObjectMeta{
-					Name:      "test",
-					Namespace: "some-ns",
-				},
-				Data: map[string][]byte{
-					"clientID":     []byte("test"),
-					"clientSecret": []byte("test"),
-					"issuerCAPath": []byte("/path/to/ca/file"),
-				},
-			})
-		}
-		return nil
+			_, err := extractOIDCSecret(tst.secret)
+			if !tst.wantErr {
+				require.NoError(t, err)
+			}
+			if tst.wantErr {
+				require.NotNil(t, err)
+			}
+		})
 	}
+}
 
-	ts, err := GetTenantSecrets(context.TODO(), k, r, s)
-	require.NoError(t, err)
-
-	expected := []*manifests.TenantSecrets{
+func TestCheckKeyIsPresent(t *testing.T) {
+	type test struct {
+		name       string
+		tenantName string
+		configMap  *corev1.ConfigMap
+		wantErr    bool
+	}
+	table := []test{
 		{
-			TenantName:   "test",
-			ClientID:     "test",
-			ClientSecret: "test",
-			IssuerCAPath: "/path/to/ca/file",
+			name:       "missing key",
+			tenantName: "tenant-a",
+			configMap:  &corev1.ConfigMap{},
+			wantErr:    true,
+		},
+		{
+			name:       "all set",
+			tenantName: "tenant-a",
+			configMap: &corev1.ConfigMap{
+				Data: map[string]string{
+					"test": "test",
+				},
+			},
 		},
 	}
-	require.ElementsMatch(t, ts, expected)
+	for _, tst := range table {
+		tst := tst
+		t.Run(tst.name, func(t *testing.T) {
+			t.Parallel()
+
+			err := checkKeyIsPresent(tst.configMap, "test")
+			if !tst.wantErr {
+				require.NoError(t, err)
+			}
+			if tst.wantErr {
+				require.NotNil(t, err)
+			}
+		})
+	}
 }

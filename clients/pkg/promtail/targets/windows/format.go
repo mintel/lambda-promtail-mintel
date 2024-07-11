@@ -9,8 +9,8 @@ import (
 
 	jsoniter "github.com/json-iterator/go"
 
-	"github.com/grafana/loki/clients/pkg/promtail/scrapeconfig"
-	"github.com/grafana/loki/clients/pkg/promtail/targets/windows/win_eventlog"
+	"github.com/grafana/loki/v3/clients/pkg/promtail/scrapeconfig"
+	"github.com/grafana/loki/v3/clients/pkg/promtail/targets/windows/win_eventlog"
 )
 
 type Event struct {
@@ -73,14 +73,16 @@ func formatLine(cfg *scrapeconfig.WindowsEventsTargetConfig, event win_eventlog.
 		Keywords:      event.Keywords,
 		TimeCreated:   event.TimeCreated.SystemTime,
 		EventRecordID: event.EventRecordID,
-		Message:       event.Message,
 	}
 
 	if !cfg.ExcludeEventData {
 		structuredEvent.EventData = string(event.EventData.InnerXML)
 	}
 	if !cfg.ExcludeUserData {
-		structuredEvent.UserData = string(event.EventData.InnerXML)
+		structuredEvent.UserData = string(event.UserData.InnerXML)
+	}
+	if !cfg.ExcludeEventMessage {
+		structuredEvent.Message = event.Message
 	}
 	if event.Correlation.ActivityID != "" || event.Correlation.RelatedActivityID != "" {
 		structuredEvent.Correlation = &Correlation{

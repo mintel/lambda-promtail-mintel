@@ -3,17 +3,20 @@ package server
 import (
 	"context"
 	"errors"
+	"fmt"
 	"net/http"
 
+	"github.com/grafana/dskit/httpgrpc"
+	"github.com/grafana/dskit/user"
 	"github.com/prometheus/prometheus/promql"
-	"github.com/weaveworks/common/httpgrpc"
-	"github.com/weaveworks/common/user"
 	"google.golang.org/grpc/codes"
-	"google.golang.org/grpc/status"
 
-	"github.com/grafana/loki/pkg/logqlmodel"
-	storage_errors "github.com/grafana/loki/pkg/storage/errors"
-	"github.com/grafana/loki/pkg/util"
+	"github.com/gogo/googleapis/google/rpc"
+	"github.com/gogo/status"
+
+	"github.com/grafana/loki/v3/pkg/logqlmodel"
+	storage_errors "github.com/grafana/loki/v3/pkg/storage/errors"
+	"github.com/grafana/loki/v3/pkg/util"
 )
 
 // StatusClientClosedRequest is the status code for when a client request cancellation of an http request
@@ -24,8 +27,27 @@ const (
 	ErrDeadlineExceeded = "Request timed out, decrease the duration of the request or add more label matchers (prefer exact match over regex match) to reduce the amount of data processed."
 )
 
+func ClientGrpcStatusAndError(err error) error {
+	if err == nil {
+		return nil
+	}
+
+	status, newErr := ClientHTTPStatusAndError(err)
+	return httpgrpc.Errorf(status, "%s", newErr.Error())
+}
+
 // WriteError write a go error with the correct status code.
 func WriteError(err error, w http.ResponseWriter) {
+	status, cerr := ClientHTTPStatusAndError(err)
+	w.Header().Set("Content-Type", "text/plain; charset=utf-8")
+	w.Header().Set("X-Content-Type-Options", "nosniff")
+	w.WriteHeader(status)
+	fmt.Fprint(w, cerr.Error())
+}
+
+// ClientHTTPStatusAndError returns error and http status that is "safe" to return to client without
+// exposing any implementation details.
+func ClientHTTPStatusAndError(err error) (int, error) {
 	var (
 		queryErr storage_errors.QueryError
 		promErr  promql.ErrStorage
@@ -33,33 +55,51 @@ func WriteError(err error, w http.ResponseWriter) {
 
 	me, ok := err.(util.MultiError)
 	if ok && me.Is(context.Canceled) {
-		http.Error(w, ErrClientCanceled, StatusClientClosedRequest)
-		return
+		return StatusClientClosedRequest, errors.New(ErrClientCanceled)
 	}
 	if ok && me.IsDeadlineExceeded() {
-		http.Error(w, ErrDeadlineExceeded, http.StatusGatewayTimeout)
-		return
+		return http.StatusGatewayTimeout, errors.New(ErrDeadlineExceeded)
 	}
 
-	s, isRPC := status.FromError(err)
+	if s, isRPC := status.FromError(err); isRPC {
+		if s.Code() == codes.DeadlineExceeded {
+			return http.StatusGatewayTimeout, errors.New(ErrDeadlineExceeded)
+		} else if int(s.Code())/100 == 4 || int(s.Code())/100 == 5 {
+			return int(s.Code()), errors.New(s.Message())
+		}
+		return http.StatusInternalServerError, err
+	}
+
 	switch {
 	case errors.Is(err, context.Canceled) ||
 		(errors.As(err, &promErr) && errors.Is(promErr.Err, context.Canceled)):
-		http.Error(w, ErrClientCanceled, StatusClientClosedRequest)
-	case errors.Is(err, context.DeadlineExceeded) ||
-		(isRPC && s.Code() == codes.DeadlineExceeded):
-		http.Error(w, ErrDeadlineExceeded, http.StatusGatewayTimeout)
+		return StatusClientClosedRequest, errors.New(ErrClientCanceled)
+	case errors.Is(err, context.DeadlineExceeded):
+		return http.StatusGatewayTimeout, errors.New(ErrDeadlineExceeded)
 	case errors.As(err, &queryErr):
-		http.Error(w, err.Error(), http.StatusBadRequest)
-	case errors.Is(err, logqlmodel.ErrLimit) || errors.Is(err, logqlmodel.ErrParse) || errors.Is(err, logqlmodel.ErrPipeline):
-		http.Error(w, err.Error(), http.StatusBadRequest)
+		return http.StatusBadRequest, err
+	case errors.Is(err, logqlmodel.ErrLimit) || errors.Is(err, logqlmodel.ErrParse) || errors.Is(err, logqlmodel.ErrPipeline) || errors.Is(err, logqlmodel.ErrBlocked) || errors.Is(err, logqlmodel.ErrParseMatchers):
+		return http.StatusBadRequest, err
 	case errors.Is(err, user.ErrNoOrgID):
-		http.Error(w, err.Error(), http.StatusBadRequest)
+		return http.StatusBadRequest, err
 	default:
 		if grpcErr, ok := httpgrpc.HTTPResponseFromError(err); ok {
-			http.Error(w, string(grpcErr.Body), int(grpcErr.Code))
-			return
+			return int(grpcErr.Code), errors.New(string(grpcErr.Body))
 		}
-		http.Error(w, err.Error(), http.StatusInternalServerError)
+		return http.StatusInternalServerError, err
 	}
+}
+
+// WrapError wraps an error in a protobuf status.
+func WrapError(err error) *rpc.Status {
+	if s, ok := status.FromError(err); ok {
+		return s.Proto()
+	}
+
+	code, err := ClientHTTPStatusAndError(err)
+	return status.New(codes.Code(code), err.Error()).Proto()
+}
+
+func UnwrapError(s *rpc.Status) error {
+	return status.ErrorProto(s)
 }

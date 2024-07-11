@@ -3,6 +3,7 @@ package v2
 import (
 	"context"
 	"net"
+	"os"
 	"strconv"
 	"strings"
 	"sync"
@@ -11,22 +12,26 @@ import (
 
 	"github.com/go-kit/log"
 	"github.com/grafana/dskit/flagext"
+	"github.com/grafana/dskit/httpgrpc"
 	"github.com/grafana/dskit/services"
+	"github.com/grafana/dskit/user"
 	"github.com/stretchr/testify/require"
-	"github.com/weaveworks/common/httpgrpc"
-	"github.com/weaveworks/common/user"
 	"go.uber.org/atomic"
 	"google.golang.org/grpc"
 
-	"github.com/grafana/loki/pkg/lokifrontend/frontend/v2/frontendv2pb"
-	"github.com/grafana/loki/pkg/querier/stats"
-	"github.com/grafana/loki/pkg/scheduler/schedulerpb"
-	"github.com/grafana/loki/pkg/util/test"
+	"github.com/grafana/loki/v3/pkg/logql/syntax"
+	"github.com/grafana/loki/v3/pkg/lokifrontend/frontend/v2/frontendv2pb"
+	"github.com/grafana/loki/v3/pkg/querier/plan"
+	"github.com/grafana/loki/v3/pkg/querier/queryrange"
+	"github.com/grafana/loki/v3/pkg/querier/stats"
+	"github.com/grafana/loki/v3/pkg/scheduler/schedulerpb"
+	"github.com/grafana/loki/v3/pkg/util/constants"
+	"github.com/grafana/loki/v3/pkg/util/test"
 )
 
 const testFrontendWorkerConcurrency = 5
 
-func setupFrontend(t *testing.T, schedulerReplyFunc func(f *Frontend, msg *schedulerpb.FrontendToScheduler) *schedulerpb.SchedulerToFrontend) (*Frontend, *mockScheduler) {
+func setupFrontend(t *testing.T, cfg Config, schedulerReplyFunc func(f *Frontend, msg *schedulerpb.FrontendToScheduler) *schedulerpb.SchedulerToFrontend) (*Frontend, *mockScheduler) {
 	l, err := net.Listen("tcp", "")
 	require.NoError(t, err)
 
@@ -38,16 +43,13 @@ func setupFrontend(t *testing.T, schedulerReplyFunc func(f *Frontend, msg *sched
 	grpcPort, err := strconv.Atoi(p)
 	require.NoError(t, err)
 
-	cfg := Config{}
-	flagext.DefaultValues(&cfg)
 	cfg.SchedulerAddress = l.Addr().String()
 	cfg.WorkerConcurrency = testFrontendWorkerConcurrency
 	cfg.Addr = h
 	cfg.Port = grpcPort
 
-	// logger := log.NewLogfmtLogger(os.Stdout)
 	logger := log.NewNopLogger()
-	f, err := NewFrontend(cfg, nil, logger, nil)
+	f, err := NewFrontend(cfg, nil, logger, nil, queryrange.DefaultCodec, constants.Loki)
 	require.NoError(t, err)
 
 	frontendv2pb.RegisterFrontendForQuerierServer(server, f)
@@ -86,9 +88,11 @@ func sendResponseWithDelay(f *Frontend, delay time.Duration, userID string, quer
 
 	ctx := user.InjectOrgID(context.Background(), userID)
 	_, _ = f.QueryResult(ctx, &frontendv2pb.QueryResultRequest{
-		QueryID:      queryID,
-		HttpResponse: resp,
-		Stats:        &stats.Stats{},
+		QueryID: queryID,
+		Response: &frontendv2pb.QueryResultRequest_HttpResponse{
+			HttpResponse: resp,
+		},
+		Stats: &stats.Stats{},
 	})
 }
 
@@ -98,7 +102,9 @@ func TestFrontendBasicWorkflow(t *testing.T) {
 		userID = "test"
 	)
 
-	f, _ := setupFrontend(t, func(f *Frontend, msg *schedulerpb.FrontendToScheduler) *schedulerpb.SchedulerToFrontend {
+	cfg := Config{}
+	flagext.DefaultValues(&cfg)
+	f, _ := setupFrontend(t, cfg, func(f *Frontend, msg *schedulerpb.FrontendToScheduler) *schedulerpb.SchedulerToFrontend {
 		// We cannot call QueryResult directly, as Frontend is not yet waiting for the response.
 		// It first needs to be told that enqueuing has succeeded.
 		go sendResponseWithDelay(f, 100*time.Millisecond, userID, msg.QueryID, &httpgrpc.HTTPResponse{
@@ -115,6 +121,41 @@ func TestFrontendBasicWorkflow(t *testing.T) {
 	require.Equal(t, []byte(body), resp.Body)
 }
 
+func TestFrontendBasicWorkflowProto(t *testing.T) {
+	const (
+		userID = "test"
+	)
+
+	ctx := user.InjectOrgID(context.Background(), userID)
+
+	req := &queryrange.LokiRequest{
+		Query: `{foo="bar"} | json`,
+		Plan: &plan.QueryPlan{
+			AST: syntax.MustParseExpr(`{foo="bar"} | json`),
+		},
+	}
+
+	resp, err := queryrange.NewEmptyResponse(req)
+	require.NoError(t, err)
+	httpReq := &httpgrpc.HTTPRequest{Url: "/loki/api/v1/query_range"}
+	httpResp, err := queryrange.DefaultCodec.EncodeHTTPGrpcResponse(ctx, httpReq, resp)
+	require.NoError(t, err)
+
+	cfg := Config{}
+	flagext.DefaultValues(&cfg)
+	cfg.Encoding = EncodingProtobuf
+	f, _ := setupFrontend(t, cfg, func(f *Frontend, msg *schedulerpb.FrontendToScheduler) *schedulerpb.SchedulerToFrontend {
+		// We cannot call QueryResult directly, as Frontend is not yet waiting for the response.
+		// It first needs to be told that enqueuing has succeeded.
+		go sendResponseWithDelay(f, 100*time.Millisecond, userID, msg.QueryID, httpResp)
+
+		return &schedulerpb.SchedulerToFrontend{Status: schedulerpb.OK}
+	})
+	actualResp, err := f.Do(ctx, req)
+	require.NoError(t, err)
+	require.Equal(t, resp.(*queryrange.LokiResponse).Data, actualResp.(*queryrange.LokiResponse).Data)
+}
+
 func TestFrontendRetryEnqueue(t *testing.T) {
 	// Frontend uses worker concurrency to compute number of retries. We use one less failure.
 	failures := atomic.NewInt64(testFrontendWorkerConcurrency - 1)
@@ -123,7 +164,9 @@ func TestFrontendRetryEnqueue(t *testing.T) {
 		userID = "test"
 	)
 
-	f, _ := setupFrontend(t, func(f *Frontend, msg *schedulerpb.FrontendToScheduler) *schedulerpb.SchedulerToFrontend {
+	cfg := Config{}
+	flagext.DefaultValues(&cfg)
+	f, _ := setupFrontend(t, cfg, func(f *Frontend, msg *schedulerpb.FrontendToScheduler) *schedulerpb.SchedulerToFrontend {
 		fail := failures.Dec()
 		if fail >= 0 {
 			return &schedulerpb.SchedulerToFrontend{Status: schedulerpb.SHUTTING_DOWN}
@@ -141,7 +184,9 @@ func TestFrontendRetryEnqueue(t *testing.T) {
 }
 
 func TestFrontendEnqueueFailure(t *testing.T) {
-	f, _ := setupFrontend(t, func(f *Frontend, msg *schedulerpb.FrontendToScheduler) *schedulerpb.SchedulerToFrontend {
+	cfg := Config{}
+	flagext.DefaultValues(&cfg)
+	f, _ := setupFrontend(t, cfg, func(f *Frontend, msg *schedulerpb.FrontendToScheduler) *schedulerpb.SchedulerToFrontend {
 		return &schedulerpb.SchedulerToFrontend{Status: schedulerpb.SHUTTING_DOWN}
 	})
 
@@ -151,7 +196,9 @@ func TestFrontendEnqueueFailure(t *testing.T) {
 }
 
 func TestFrontendCancellation(t *testing.T) {
-	f, ms := setupFrontend(t, nil)
+	cfg := Config{}
+	flagext.DefaultValues(&cfg)
+	f, ms := setupFrontend(t, cfg, nil)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
 	defer cancel()
@@ -180,7 +227,9 @@ func TestFrontendCancellation(t *testing.T) {
 // all the frontend workers thus not reaching the scheduler as well.
 // Issue: https://github.com/grafana/loki/issues/5132
 func TestFrontendWorkerCancellation(t *testing.T) {
-	f, ms := setupFrontend(t, nil)
+	cfg := Config{}
+	flagext.DefaultValues(&cfg)
+	f, ms := setupFrontend(t, cfg, nil)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
 	defer cancel()
@@ -215,7 +264,9 @@ func TestFrontendWorkerCancellation(t *testing.T) {
 }
 
 func TestFrontendFailedCancellation(t *testing.T) {
-	f, ms := setupFrontend(t, nil)
+	cfg := Config{}
+	flagext.DefaultValues(&cfg)
+	f, ms := setupFrontend(t, cfg, nil)
 
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -250,6 +301,125 @@ func TestFrontendFailedCancellation(t *testing.T) {
 	ms.checkWithLock(func() {
 		require.Equal(t, 1, len(ms.msgs))
 	})
+}
+
+func TestFrontendStoppingWaitsForEmptyInflightRequests(t *testing.T) {
+	delayResponse := 10 * time.Millisecond
+	cfg := Config{}
+	flagext.DefaultValues(&cfg)
+	f, _ := setupFrontend(t, cfg, func(f *Frontend, msg *schedulerpb.FrontendToScheduler) *schedulerpb.SchedulerToFrontend {
+		// We cannot call QueryResult directly, as Frontend is not yet waiting for the response.
+		// It first needs to be told that enqueuing has succeeded.
+		go sendResponseWithDelay(f, 2*delayResponse, "test", msg.QueryID, &httpgrpc.HTTPResponse{
+			Code: 200,
+			Body: []byte("ok"),
+		})
+
+		// give enough time to fill up inflight requests
+		time.Sleep(delayResponse)
+		return &schedulerpb.SchedulerToFrontend{Status: schedulerpb.OK}
+	})
+
+	inflightRequests := 10
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	for i := 0; i < inflightRequests; i++ {
+		go func() {
+			_, err := f.RoundTripGRPC(user.InjectOrgID(ctx, "test"), &httpgrpc.HTTPRequest{})
+			require.NoError(t, err)
+		}()
+	}
+
+	require.Eventually(t, func() bool {
+		return f.requests.count() == inflightRequests
+	},
+		3*delayResponse, // wait at least 3*delayResponse to wait for queries to be finished and removed from inlight requests map
+		5*time.Millisecond,
+	)
+
+	// blocks until all inflight requests are done
+	_ = f.stopping(nil)
+	require.Equal(t, 0, f.requests.count())
+}
+
+func TestFrontendShuttingDownLetsSubRequestsPass(t *testing.T) {
+	delayResponse := 100 * time.Millisecond
+	cfg := Config{}
+	flagext.DefaultValues(&cfg)
+	f, _ := setupFrontend(t, cfg, func(f *Frontend, msg *schedulerpb.FrontendToScheduler) *schedulerpb.SchedulerToFrontend {
+		// We cannot call QueryResult directly, as Frontend is not yet waiting for the response.
+		// It first needs to be told that enqueuing has succeeded.
+		go sendResponseWithDelay(f, delayResponse, "test", msg.QueryID, &httpgrpc.HTTPResponse{
+			Code: 200,
+			Body: []byte("ok"),
+		})
+
+		return &schedulerpb.SchedulerToFrontend{Status: schedulerpb.OK}
+	})
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	require.Equal(t, services.Running, f.State())
+
+	var wg sync.WaitGroup
+
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		_, err := f.RoundTripGRPC(user.InjectOrgID(ctx, "test"), &httpgrpc.HTTPRequest{})
+		require.NoError(t, err)
+	}()
+
+	// Wait less than delayResponse to make sure we have an inflight request that
+	// already was sent to the scheduler and the service stays in Stopping state
+	// for some time.
+	time.Sleep(delayResponse / 10)
+
+	f.StopAsync()
+
+	// wait for Stopping state
+	require.Eventually(t, func() bool {
+		t.Log(f.State())
+		return f.State() == services.Stopping
+	}, delayResponse/2, 2*time.Millisecond)
+
+	// send (sub-)request
+	// This request still needs to be able to pass the RoundTripGRCP function,
+	// because it may be a sub-request of a query request that was split earlier
+	// into multiple sub-requests.
+	_, err := f.RoundTripGRPC(user.InjectOrgID(ctx, "test"), &httpgrpc.HTTPRequest{})
+	require.NoError(t, err)
+
+	wg.Wait()
+}
+
+func TestProtobufBackwardsCompatibility(t *testing.T) {
+	expected := &frontendv2pb.QueryResultRequest{
+		QueryID: 42,
+		Response: &frontendv2pb.QueryResultRequest_HttpResponse{
+			HttpResponse: &httpgrpc.HTTPResponse{
+				Code:    200,
+				Headers: []*httpgrpc.Header{{Key: "foo", Values: []string{"bar"}}},
+				Body:    []byte("Hello world!"),
+			},
+		},
+		Stats: &stats.Stats{
+			FetchedSeriesCount: 100,
+			FetchedChunkBytes:  1024,
+		},
+	}
+
+	b, err := os.ReadFile("testdata/k173.bin")
+	require.NoError(t, err)
+
+	actual := &frontendv2pb.QueryResultRequest{}
+	err = actual.Unmarshal(b)
+	require.NoError(t, err)
+
+	require.IsType(t, &frontendv2pb.QueryResultRequest_HttpResponse{}, actual.Response)
+	require.EqualValues(t, expected, actual)
 }
 
 type mockScheduler struct {

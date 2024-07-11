@@ -7,10 +7,10 @@ import (
 	"log"
 	"time"
 
-	"github.com/prometheus/prometheus/util/modtimevfs"
+	"github.com/prometheus/alertmanager/pkg/modtimevfs"
 	"github.com/shurcooL/vfsgen"
 
-	"github.com/grafana/loki/clients/pkg/promtail/server/ui"
+	"github.com/grafana/loki/v3/clients/pkg/promtail/server/ui"
 )
 
 func main() {

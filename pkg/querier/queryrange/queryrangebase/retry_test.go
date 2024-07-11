@@ -8,9 +8,11 @@ import (
 	"testing"
 
 	"github.com/go-kit/log"
+	"github.com/grafana/dskit/httpgrpc"
 	"github.com/stretchr/testify/require"
-	"github.com/weaveworks/common/httpgrpc"
 	"go.uber.org/atomic"
+
+	"github.com/grafana/loki/v3/pkg/util/constants"
 )
 
 func TestRetry(t *testing.T) {
@@ -59,8 +61,11 @@ func TestRetry(t *testing.T) {
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			try.Store(0)
-			h := NewRetryMiddleware(log.NewNopLogger(), 5, nil).Wrap(tc.handler)
-			resp, err := h.Do(context.Background(), nil)
+			h := NewRetryMiddleware(log.NewNopLogger(), 5, nil, constants.Loki).Wrap(tc.handler)
+			req := &PrometheusRequest{
+				Query: `{env="test"} |= "error"`,
+			}
+			resp, err := h.Do(context.Background(), req)
 			require.Equal(t, tc.err, err)
 			require.Equal(t, tc.resp, resp)
 		})
@@ -68,26 +73,30 @@ func TestRetry(t *testing.T) {
 }
 
 func Test_RetryMiddlewareCancel(t *testing.T) {
+	req := &PrometheusRequest{
+		Query: `{env="test"} |= "error"`,
+	}
+
 	var try atomic.Int32
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
-	_, err := NewRetryMiddleware(log.NewNopLogger(), 5, nil).Wrap(
+	_, err := NewRetryMiddleware(log.NewNopLogger(), 5, nil, constants.Loki).Wrap(
 		HandlerFunc(func(c context.Context, r Request) (Response, error) {
 			try.Inc()
 			return nil, ctx.Err()
 		}),
-	).Do(ctx, nil)
+	).Do(ctx, req)
 	require.Equal(t, int32(0), try.Load())
 	require.Equal(t, ctx.Err(), err)
 
 	ctx, cancel = context.WithCancel(context.Background())
-	_, err = NewRetryMiddleware(log.NewNopLogger(), 5, nil).Wrap(
+	_, err = NewRetryMiddleware(log.NewNopLogger(), 5, nil, constants.Loki).Wrap(
 		HandlerFunc(func(c context.Context, r Request) (Response, error) {
 			try.Inc()
 			cancel()
 			return nil, errors.New("failed")
 		}),
-	).Do(ctx, nil)
+	).Do(ctx, req)
 	require.Equal(t, int32(1), try.Load())
 	require.Equal(t, ctx.Err(), err)
 }

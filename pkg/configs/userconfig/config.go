@@ -13,7 +13,7 @@ import (
 	"github.com/prometheus/prometheus/rules"
 	"gopkg.in/yaml.v3"
 
-	util_log "github.com/grafana/loki/pkg/util/log"
+	util_log "github.com/grafana/loki/v3/pkg/util/log"
 )
 
 // An ID is the ID of a single users's Cortex configuration. When a
@@ -305,6 +305,7 @@ func (c RulesConfig) parseV2() (map[string][]rules.Rule, error) {
 						rl.Alert.Value,
 						expr,
 						time.Duration(rl.For),
+						time.Duration(rl.KeepFiringFor),
 						labels.FromMap(rl.Labels),
 						labels.FromMap(rl.Annotations),
 						nil,

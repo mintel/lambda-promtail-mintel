@@ -4,7 +4,6 @@ import (
 	"crypto/sha256"
 	"flag"
 	"fmt"
-	"io/ioutil"
 	"log"
 	"os"
 	"strings"
@@ -66,6 +65,7 @@ func printFile(filename string, blockDetails, printLines, storeBlocks bool) {
 		return
 	}
 
+	fmt.Println("Format (Version):", lokiChunk.format)
 	fmt.Println("Encoding:", lokiChunk.encoding)
 	fmt.Print("Blocks Metadata Checksum: ", fmt.Sprintf("%08x", lokiChunk.metadataChecksum))
 	if lokiChunk.metadataChecksum == lokiChunk.computedMetadataChecksum {
@@ -122,7 +122,7 @@ func printFile(filename string, blockDetails, printLines, storeBlocks bool) {
 }
 
 func writeBlockToFile(data []byte, blockIndex int, filename string) {
-	err := ioutil.WriteFile(filename, data, 0644)
+	err := os.WriteFile(filename, data, 0644)
 	if err != nil {
 		log.Println("Failed to store block", blockIndex, "to file", filename, "due to error:", err)
 	} else {

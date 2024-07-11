@@ -4,7 +4,7 @@ import (
 	"bytes"
 	"context"
 	"fmt"
-	"io/ioutil"
+	"io"
 	"sort"
 	"strings"
 	"sync"
@@ -18,7 +18,7 @@ import (
 	"github.com/aws/aws-sdk-go/service/s3/s3iface"
 	"github.com/go-kit/log/level"
 
-	util_log "github.com/grafana/loki/pkg/util/log"
+	util_log "github.com/grafana/loki/v3/pkg/util/log"
 )
 
 const arnPrefix = "arn:"
@@ -195,7 +195,7 @@ func (m *mockDynamoDBClient) batchGetItemRequest(_ context.Context, input *dynam
 	}
 }
 
-func (m *mockDynamoDBClient) QueryPagesWithContext(ctx aws.Context, input *dynamodb.QueryInput, fn func(*dynamodb.QueryOutput, bool) bool, opts ...request.Option) error {
+func (m *mockDynamoDBClient) QueryPagesWithContext(_ aws.Context, input *dynamodb.QueryInput, fn func(*dynamodb.QueryOutput, bool) bool, _ ...request.Option) error {
 	result := &dynamodb.QueryOutput{
 		Items: []map[string]*dynamodb.AttributeValue{},
 	}
@@ -267,7 +267,7 @@ func (m *dynamoDBMockRequest) Retryable() bool {
 	return false
 }
 
-func (m *mockDynamoDBClient) ListTablesPagesWithContext(_ aws.Context, input *dynamodb.ListTablesInput, fn func(*dynamodb.ListTablesOutput, bool) bool, _ ...request.Option) error {
+func (m *mockDynamoDBClient) ListTablesPagesWithContext(_ aws.Context, _ *dynamodb.ListTablesInput, fn func(*dynamodb.ListTablesOutput, bool) bool, _ ...request.Option) error {
 	m.mtx.RLock()
 	defer m.mtx.RUnlock()
 
@@ -404,7 +404,7 @@ func (m *mockS3) PutObjectWithContext(_ aws.Context, req *s3.PutObjectInput, _ .
 	m.Lock()
 	defer m.Unlock()
 
-	buf, err := ioutil.ReadAll(req.Body)
+	buf, err := io.ReadAll(req.Body)
 	if err != nil {
 		return nil, err
 	}
@@ -423,6 +423,6 @@ func (m *mockS3) GetObjectWithContext(_ aws.Context, req *s3.GetObjectInput, _ .
 	}
 
 	return &s3.GetObjectOutput{
-		Body: ioutil.NopCloser(bytes.NewReader(buf)),
+		Body: io.NopCloser(bytes.NewReader(buf)),
 	}, nil
 }

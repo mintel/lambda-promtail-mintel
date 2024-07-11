@@ -3,14 +3,15 @@ package base
 import (
 	"github.com/prometheus/client_golang/prometheus"
 
-	"github.com/grafana/loki/pkg/util"
+	"github.com/grafana/loki/v3/pkg/util"
 )
 
 // ManagerMetrics aggregates metrics exported by the Prometheus
 // rules package and returns them as Cortex metrics
 type ManagerMetrics struct {
-	regs                  *util.UserRegistries
-	disableRuleGroupLabel bool
+	regs                   *util.UserRegistries
+	disableRuleGroupLabel  bool
+	metricLabelTransformer util.MetricLabelTransformFunc
 
 	EvalDuration         *prometheus.Desc
 	IterationDuration    *prometheus.Desc
@@ -25,78 +26,82 @@ type ManagerMetrics struct {
 	GroupLastEvalSamples *prometheus.Desc
 }
 
+// RuleGroupLabel is the label added by Prometheus, the value of which comes from the GroupKey function
+const RuleGroupLabel = "rule_group"
+
 // NewManagerMetrics returns a ManagerMetrics struct
-func NewManagerMetrics(disableRuleGroupLabel bool) *ManagerMetrics {
+func NewManagerMetrics(disableRuleGroupLabel bool, tf util.MetricLabelTransformFunc, metricsNamespace string) *ManagerMetrics {
 	commonLabels := []string{"user"}
 	if !disableRuleGroupLabel {
-		commonLabels = append(commonLabels, "rule_group")
+		commonLabels = append(commonLabels, RuleGroupLabel)
 	}
 	return &ManagerMetrics{
-		regs:                  util.NewUserRegistries(),
-		disableRuleGroupLabel: disableRuleGroupLabel,
+		regs:                   util.NewUserRegistries(),
+		disableRuleGroupLabel:  disableRuleGroupLabel,
+		metricLabelTransformer: tf,
 
 		EvalDuration: prometheus.NewDesc(
-			"cortex_prometheus_rule_evaluation_duration_seconds",
+			metricsNamespace+"_prometheus_rule_evaluation_duration_seconds",
 			"The duration for a rule to execute.",
 			[]string{"user"},
 			nil,
 		),
 		IterationDuration: prometheus.NewDesc(
-			"cortex_prometheus_rule_group_duration_seconds",
+			metricsNamespace+"_prometheus_rule_group_duration_seconds",
 			"The duration of rule group evaluations.",
 			[]string{"user"},
 			nil,
 		),
 		IterationsMissed: prometheus.NewDesc(
-			"cortex_prometheus_rule_group_iterations_missed_total",
+			metricsNamespace+"_prometheus_rule_group_iterations_missed_total",
 			"The total number of rule group evaluations missed due to slow rule group evaluation.",
 			commonLabels,
 			nil,
 		),
 		IterationsScheduled: prometheus.NewDesc(
-			"cortex_prometheus_rule_group_iterations_total",
+			metricsNamespace+"_prometheus_rule_group_iterations_total",
 			"The total number of scheduled rule group evaluations, whether executed or missed.",
 			commonLabels,
 			nil,
 		),
 		EvalTotal: prometheus.NewDesc(
-			"cortex_prometheus_rule_evaluations_total",
+			metricsNamespace+"_prometheus_rule_evaluations_total",
 			"The total number of rule evaluations.",
 			commonLabels,
 			nil,
 		),
 		EvalFailures: prometheus.NewDesc(
-			"cortex_prometheus_rule_evaluation_failures_total",
+			metricsNamespace+"_prometheus_rule_evaluation_failures_total",
 			"The total number of rule evaluation failures.",
 			commonLabels,
 			nil,
 		),
 		GroupInterval: prometheus.NewDesc(
-			"cortex_prometheus_rule_group_interval_seconds",
+			metricsNamespace+"_prometheus_rule_group_interval_seconds",
 			"The interval of a rule group.",
 			commonLabels,
 			nil,
 		),
 		GroupLastEvalTime: prometheus.NewDesc(
-			"cortex_prometheus_rule_group_last_evaluation_timestamp_seconds",
+			metricsNamespace+"_prometheus_rule_group_last_evaluation_timestamp_seconds",
 			"The timestamp of the last rule group evaluation in seconds.",
 			commonLabels,
 			nil,
 		),
 		GroupLastDuration: prometheus.NewDesc(
-			"cortex_prometheus_rule_group_last_duration_seconds",
+			metricsNamespace+"_prometheus_rule_group_last_duration_seconds",
 			"The duration of the last rule group evaluation.",
 			commonLabels,
 			nil,
 		),
 		GroupRules: prometheus.NewDesc(
-			"cortex_prometheus_rule_group_rules",
+			metricsNamespace+"_prometheus_rule_group_rules",
 			"The number of rules.",
 			commonLabels,
 			nil,
 		),
 		GroupLastEvalSamples: prometheus.NewDesc(
-			"cortex_prometheus_last_evaluation_samples",
+			metricsNamespace+"_prometheus_last_evaluation_samples",
 			"The number of samples returned during the last rule group evaluation.",
 			commonLabels,
 			nil,
@@ -131,10 +136,10 @@ func (m *ManagerMetrics) Describe(out chan<- *prometheus.Desc) {
 
 // Collect implements the Collector interface
 func (m *ManagerMetrics) Collect(out chan<- prometheus.Metric) {
-	data := m.regs.BuildMetricFamiliesPerUser()
+	data := m.regs.BuildMetricFamiliesPerUser(m.metricLabelTransformer)
 	labels := []string{}
 	if !m.disableRuleGroupLabel {
-		labels = append(labels, "rule_group")
+		labels = append(labels, RuleGroupLabel)
 	}
 	// WARNING: It is important that all metrics generated in this method are "Per User".
 	// Thanks to that we can actually *remove* metrics for given user (see RemoveUserRegistry).

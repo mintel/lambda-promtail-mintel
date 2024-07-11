@@ -2,7 +2,7 @@
 
 [Fluentd](https://fluentd.org/) is a data collector for unified logging layer, it can be configured with the Loki output plugin, provided in this folder, to ship logs to Loki.
 
-See [docs/client/fluentd/README.md](../../docs/sources/clients/fluentd/_index.md) for detailed information.
+See the [Fluentd documentation](../../../docs/sources/send-data/fluentd/_index.md) for detailed information.
 
 ## Development
 
@@ -81,6 +81,15 @@ The expected output is:
   }
 ]
 ```
+
+## Build and publish gem
+
+To build and publish a gem to
+[rubygems](https://rubygems.org/gems/fluent-plugin-grafana-loki) you first need
+to update the version in the `fluent-plugin-grafana-loki.gemspec` file.
+Then update the `VERSION` variable in the `Makefile` to match the new version number.
+Create a PR with the changes against the `main` branch und run `make
+fluentd-plugin-push` from the root of the project once the PR has been merged.
 
 ## Copyright
 

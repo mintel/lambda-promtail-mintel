@@ -55,7 +55,7 @@ func (set CommaSeparatedCIDRSet) Contains(p netip.Prefix) bool {
 
 // Match returns true if ip matches any of the prefixes in this set.
 func (set CommaSeparatedCIDRSet) Match(ip netip.Addr) bool {
-	for prefix, _ := range set {
+	for prefix := range set {
 		if prefix.Contains(ip) {
 			return true
 		}

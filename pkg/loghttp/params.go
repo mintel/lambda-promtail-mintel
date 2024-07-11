@@ -8,19 +8,46 @@ import (
 	"strings"
 	"time"
 
+	"github.com/c2h5oh/datasize"
 	"github.com/pkg/errors"
 	"github.com/prometheus/common/model"
 
-	"github.com/grafana/loki/pkg/logproto"
+	"github.com/grafana/loki/v3/pkg/logproto"
+	"github.com/grafana/loki/v3/pkg/logql/log"
+	"github.com/grafana/loki/v3/pkg/logql/syntax"
 )
 
 const (
 	defaultQueryLimit = 100
+	defaultFieldLimit = 1000
 	defaultSince      = 1 * time.Hour
+	defaultDirection  = logproto.BACKWARD
 )
 
 func limit(r *http.Request) (uint32, error) {
 	l, err := parseInt(r.Form.Get("limit"), defaultQueryLimit)
+	if err != nil {
+		return 0, err
+	}
+	if l <= 0 {
+		return 0, errors.New("limit must be a positive value")
+	}
+	return uint32(l), nil
+}
+
+func lineLimit(r *http.Request) (uint32, error) {
+	l, err := parseInt(r.Form.Get("line_limit"), defaultQueryLimit)
+	if err != nil {
+		return 0, err
+	}
+	if l <= 0 {
+		return 0, errors.New("limit must be a positive value")
+	}
+	return uint32(l), nil
+}
+
+func fieldLimit(r *http.Request) (uint32, error) {
+	l, err := parseInt(r.Form.Get("field_limit"), defaultFieldLimit)
 	if err != nil {
 		return 0, err
 	}
@@ -39,7 +66,7 @@ func ts(r *http.Request) (time.Time, error) {
 }
 
 func direction(r *http.Request) (logproto.Direction, error) {
-	return parseDirection(r.Form.Get("direction"), logproto.BACKWARD)
+	return parseDirection(r.Form.Get("direction"), defaultDirection)
 }
 
 func shards(r *http.Request) []string {
@@ -48,14 +75,40 @@ func shards(r *http.Request) []string {
 
 func bounds(r *http.Request) (time.Time, time.Time, error) {
 	now := time.Now()
-	start, err := parseTimestamp(r.Form.Get("start"), now.Add(-defaultSince))
-	if err != nil {
-		return time.Time{}, time.Time{}, err
+	start := r.Form.Get("start")
+	end := r.Form.Get("end")
+	since := r.Form.Get("since")
+	return determineBounds(now, start, end, since)
+}
+
+func determineBounds(now time.Time, startString, endString, sinceString string) (time.Time, time.Time, error) {
+	since := defaultSince
+	if sinceString != "" {
+		d, err := model.ParseDuration(sinceString)
+		if err != nil {
+			return time.Time{}, time.Time{}, errors.Wrap(err, "could not parse 'since' parameter")
+		}
+		since = time.Duration(d)
 	}
-	end, err := parseTimestamp(r.Form.Get("end"), now)
+
+	end, err := parseTimestamp(endString, now)
 	if err != nil {
-		return time.Time{}, time.Time{}, err
+		return time.Time{}, time.Time{}, errors.Wrap(err, "could not parse 'end' parameter")
 	}
+
+	// endOrNow is used to apply a default for the start time or an offset if 'since' is provided.
+	// we want to use the 'end' time so long as it's not in the future as this should provide
+	// a more intuitive experience when end time is in the future.
+	endOrNow := end
+	if end.After(now) {
+		endOrNow = now
+	}
+
+	start, err := parseTimestamp(startString, endOrNow.Add(-since))
+	if err != nil {
+		return time.Time{}, time.Time{}, errors.Wrap(err, "could not parse 'start' parameter")
+	}
+
 	return start, end, nil
 }
 
@@ -98,7 +151,7 @@ func parseInt(value string, def int) (int, error) {
 	return strconv.Atoi(value)
 }
 
-// parseUnixNano parses a ns unix timestamp from a string
+// parseTimestamp parses a ns unix timestamp from a string
 // if the value is empty it returns a default value passed as second parameter
 func parseTimestamp(value string, def time.Time) (time.Time, error) {
 	if value == "" {
@@ -151,4 +204,41 @@ func parseSecondsOrDuration(value string) (time.Duration, error) {
 		return time.Duration(d), nil
 	}
 	return 0, errors.Errorf("cannot parse %q to a valid duration", value)
+}
+
+// parseRegexQuery parses regex and query querystring from httpRequest and returns the combined LogQL query.
+// This is used only to keep regexp query string support until it gets fully deprecated.
+func parseRegexQuery(httpRequest *http.Request) (string, error) {
+	query := httpRequest.Form.Get("query")
+	regexp := httpRequest.Form.Get("regexp")
+	if regexp != "" {
+		expr, err := syntax.ParseLogSelector(query, true)
+		if err != nil {
+			return "", err
+		}
+		newExpr, err := syntax.AddFilterExpr(expr, log.LineMatchRegexp, "", regexp)
+		if err != nil {
+			return "", err
+		}
+		query = newExpr.String()
+	}
+	return query, nil
+}
+
+func parseBytes(r *http.Request, field string, optional bool) (val datasize.ByteSize, err error) {
+	s := r.Form.Get(field)
+
+	if s == "" {
+		if !optional {
+			return 0, fmt.Errorf("missing %s", field)
+		}
+		return val, nil
+	}
+
+	if err := val.UnmarshalText([]byte(s)); err != nil {
+		return 0, errors.Wrapf(err, "invalid %s: %s", field, s)
+	}
+
+	return val, nil
+
 }

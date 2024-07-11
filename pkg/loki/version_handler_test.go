@@ -1,14 +1,14 @@
 package loki
 
 import (
-	"io/ioutil"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"testing"
 
 	"github.com/stretchr/testify/assert"
 
-	"github.com/grafana/loki/pkg/util/build"
+	"github.com/grafana/loki/v3/pkg/util/build"
 )
 
 func TestVersionHandler(t *testing.T) {
@@ -35,7 +35,7 @@ func TestVersionHandler(t *testing.T) {
 		"revision":"foobar",
 		"goVersion": "42"
 	}`
-	body, err := ioutil.ReadAll(resp.Body)
+	body, err := io.ReadAll(resp.Body)
 	assert.NoError(t, err)
 	assert.JSONEq(t, expected, string(body))
 }

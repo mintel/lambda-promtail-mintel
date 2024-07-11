@@ -5,12 +5,10 @@ import (
 	"unicode/utf8"
 
 	"github.com/prometheus/common/model"
-	"github.com/prometheus/prometheus/model/labels"
 
-	"github.com/grafana/loki/pkg/logproto"
-	"github.com/grafana/loki/pkg/storage/chunk"
-	"github.com/grafana/loki/pkg/storage/config"
-	"github.com/grafana/loki/pkg/util"
+	"github.com/grafana/loki/v3/pkg/logproto"
+	"github.com/grafana/loki/v3/pkg/storage/chunk"
+	"github.com/grafana/loki/v3/pkg/util"
 )
 
 func filterChunksByTime(from, through model.Time, chunks []chunk.Chunk) []chunk.Chunk {
@@ -39,15 +37,18 @@ func labelNamesFromChunks(chunks []chunk.Chunk) []string {
 	var result util.UniqueStrings
 	for _, c := range chunks {
 		for _, l := range c.Metric {
+			if l.Name == model.MetricNameLabel {
+				continue
+			}
+
 			result.Add(l.Name)
 		}
 	}
 	return result.Strings()
 }
 
-func filterChunksByUniqueFingerprint(s config.SchemaConfig, chunks []chunk.Chunk) ([]chunk.Chunk, []string) {
+func filterChunksByUniqueFingerprint(chunks []chunk.Chunk) []chunk.Chunk {
 	filtered := make([]chunk.Chunk, 0, len(chunks))
-	keys := make([]string, 0, len(chunks))
 	uniqueFp := map[model.Fingerprint]struct{}{}
 
 	for _, chunk := range chunks {
@@ -55,15 +56,13 @@ func filterChunksByUniqueFingerprint(s config.SchemaConfig, chunks []chunk.Chunk
 			continue
 		}
 		filtered = append(filtered, chunk)
-		keys = append(keys, s.ExternalKey(chunk.ChunkRef))
 		uniqueFp[chunk.FingerprintModel()] = struct{}{}
 	}
-	return filtered, keys
+	return filtered
 }
 
-func filterChunkRefsByUniqueFingerprint(s config.SchemaConfig, chunks []logproto.ChunkRef) ([]chunk.Chunk, []string) {
+func filterChunkRefsByUniqueFingerprint(chunks []logproto.ChunkRef) []chunk.Chunk {
 	filtered := make([]chunk.Chunk, 0, len(chunks))
-	keys := make([]string, 0, len(chunks))
 	uniqueFp := map[model.Fingerprint]struct{}{}
 
 	for _, c := range chunks {
@@ -73,10 +72,9 @@ func filterChunkRefsByUniqueFingerprint(s config.SchemaConfig, chunks []logproto
 		filtered = append(filtered, chunk.Chunk{
 			ChunkRef: c,
 		})
-		keys = append(keys, s.ExternalKey(c))
 		uniqueFp[c.FingerprintModel()] = struct{}{}
 	}
-	return filtered, keys
+	return filtered
 }
 
 func uniqueStrings(cs []string) []string {
@@ -170,14 +168,4 @@ func FindSetMatches(pattern string) []string {
 		}
 	}
 	return matches
-}
-
-// Using this function avoids logging of nil matcher, which works, but indirectly via panic and recover.
-// That confuses attached debugger, which wants to breakpoint on each panic.
-// Using simple check is also faster.
-func formatMatcher(matcher *labels.Matcher) string {
-	if matcher == nil {
-		return "nil"
-	}
-	return matcher.String()
 }

@@ -7,8 +7,9 @@ import (
 	"time"
 
 	"github.com/aws/aws-lambda-go/events"
-	"github.com/grafana/loki/pkg/logproto"
 	"github.com/prometheus/common/model"
+
+	"github.com/grafana/loki/pkg/logproto"
 )
 
 // CloudWatchSamplingConfig represents some pattern of CloudWatch logs that
@@ -75,11 +76,11 @@ func (conf *CloudWatchSamplingConfig) Keep() bool {
 func parseCWEvent(ctx context.Context, b *batch, ev *events.CloudwatchLogsEvent) error {
 	data, err := ev.AWSLogs.Parse()
 	if err != nil {
-		fmt.Println("error parsing log event: ", err)
 		return err
 	}
 
 	labels := model.LabelSet{
+		model.LabelName("__aws_log_type"):             model.LabelValue("cloudwatch"),
 		model.LabelName("__aws_cloudwatch_log_group"): model.LabelValue(data.LogGroup),
 		model.LabelName("__aws_cloudwatch_owner"):     model.LabelValue(data.Owner),
 	}
@@ -95,7 +96,7 @@ func parseCWEvent(ctx context.Context, b *batch, ev *events.CloudwatchLogsEvent)
 		}
 	}
 
-	labels = applyExtraLabels(labels)
+	labels = applyLabels(labels)
 
 outer:
 	for _, event := range data.LogEvents {
@@ -110,29 +111,32 @@ outer:
 
 		timestamp := time.UnixMilli(event.Timestamp)
 
-		b.add(ctx, entry{labels, logproto.Entry{
+		if err := b.add(ctx, entry{labels, logproto.Entry{
 			Line:      event.Message,
 			Timestamp: timestamp,
-		}})
+		}}); err != nil {
+			return err
+		}
 	}
 
 	return nil
 }
 
-func processCWEvent(ctx context.Context, ev *events.CloudwatchLogsEvent) error {
-
-	fmt.Println("processing new CWEvent")
-
-	batch, _ := newBatch(ctx)
-
-	err := parseCWEvent(ctx, batch, ev)
+func processCWEvent(ctx context.Context, ev *events.CloudwatchLogsEvent, pClient Client) error {
+	batch, err := newBatch(ctx, pClient)
 	if err != nil {
 		return err
 	}
 
-	err = sendToPromtail(ctx, batch)
+	err = parseCWEvent(ctx, batch, ev)
+	if err != nil {
+		return fmt.Errorf("error parsing log event: %s", err)
+	}
+
+	err = pClient.sendToPromtail(ctx, batch)
 	if err != nil {
 		return err
 	}
+
 	return nil
 }

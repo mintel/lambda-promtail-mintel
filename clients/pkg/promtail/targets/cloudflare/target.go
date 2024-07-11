@@ -8,22 +8,22 @@ import (
 	"sync"
 	"time"
 
-	"github.com/buger/jsonparser"
-	"github.com/cloudflare/cloudflare-go"
 	"github.com/go-kit/log"
 	"github.com/go-kit/log/level"
+	"github.com/grafana/cloudflare-go"
 	"github.com/grafana/dskit/backoff"
 	"github.com/grafana/dskit/concurrency"
 	"github.com/grafana/dskit/multierror"
+	"github.com/grafana/jsonparser"
 	"github.com/prometheus/common/model"
 	"go.uber.org/atomic"
 
-	"github.com/grafana/loki/clients/pkg/promtail/api"
-	"github.com/grafana/loki/clients/pkg/promtail/positions"
-	"github.com/grafana/loki/clients/pkg/promtail/scrapeconfig"
-	"github.com/grafana/loki/clients/pkg/promtail/targets/target"
+	"github.com/grafana/loki/v3/clients/pkg/promtail/api"
+	"github.com/grafana/loki/v3/clients/pkg/promtail/positions"
+	"github.com/grafana/loki/v3/clients/pkg/promtail/scrapeconfig"
+	"github.com/grafana/loki/v3/clients/pkg/promtail/targets/target"
 
-	"github.com/grafana/loki/pkg/logproto"
+	"github.com/grafana/loki/v3/pkg/logproto"
 )
 
 // The minimun window size is 1 minute.
@@ -63,7 +63,7 @@ func NewTarget(
 	if err := validateConfig(config); err != nil {
 		return nil, err
 	}
-	fields, err := Fields(FieldsType(config.FieldsType))
+	fields, err := Fields(FieldsType(config.FieldsType), config.AdditionalFields)
 	if err != nil {
 		return nil, err
 	}
@@ -158,6 +158,9 @@ func (t *Target) pull(ctx context.Context, start, end time.Time) error {
 			level.Warn(t.logger).Log("msg", "failed iterating over logs, out of cloudflare range, not retrying", "err", err, "start", start, "end", end, "retries", backoff.NumRetries())
 			return nil
 		} else if err != nil {
+			if it != nil {
+				it.Close()
+			}
 			errs.Add(err)
 			backoff.Wait()
 			continue
@@ -220,10 +223,14 @@ func (t *Target) Ready() bool {
 }
 
 func (t *Target) Details() interface{} {
-	fields, _ := Fields(FieldsType(t.config.FieldsType))
+	fields, _ := Fields(FieldsType(t.config.FieldsType), t.config.AdditionalFields)
+	var errMsg string
+	if t.err != nil {
+		errMsg = t.err.Error()
+	}
 	return map[string]string{
 		"zone_id":        t.config.ZoneID,
-		"error":          t.err.Error(),
+		"error":          errMsg,
 		"position":       t.positions.GetString(positions.CursorKey(t.config.ZoneID)),
 		"last_timestamp": t.to.String(),
 		"fields":         strings.Join(fields, ","),

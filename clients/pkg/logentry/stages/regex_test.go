@@ -14,7 +14,7 @@ import (
 	"github.com/stretchr/testify/assert"
 	"gopkg.in/yaml.v2"
 
-	util_log "github.com/grafana/loki/pkg/util/log"
+	util_log "github.com/grafana/loki/v3/pkg/util/log"
 )
 
 var testRegexYamlSingleStageWithoutSource = `
@@ -374,6 +374,7 @@ func BenchmarkRegexStage(b *testing.B) {
 			in := make(chan Entry)
 			out := stage.Run(in)
 			go func() {
+				//nolint:revive
 				for range out {
 				}
 			}()

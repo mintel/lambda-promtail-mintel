@@ -12,12 +12,20 @@ import (
 	"testing"
 	"time"
 
+	"gopkg.in/yaml.v2"
+
 	"github.com/grafana/dskit/backoff"
+	"github.com/grafana/dskit/flagext"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"go.uber.org/atomic"
 
-	"github.com/grafana/loki/pkg/storage/chunk/client/hedging"
+	"github.com/grafana/loki/v3/pkg/storage/chunk/client/hedging"
+
+	"github.com/aws/aws-sdk-go/aws"
+	"github.com/aws/aws-sdk-go/aws/request"
+	"github.com/aws/aws-sdk-go/service/s3"
+	"github.com/aws/aws-sdk-go/service/s3/s3iface"
 )
 
 type RoundTripperFunc func(*http.Request) (*http.Response, error)
@@ -38,7 +46,7 @@ func TestRequestMiddleware(t *testing.T) {
 		S3ForcePathStyle: true,
 		Insecure:         true,
 		AccessKeyID:      "key",
-		SecretAccessKey:  "secret",
+		SecretAccessKey:  flagext.SecretWithValue("secret"),
 	}
 
 	tests := []struct {
@@ -127,7 +135,7 @@ func Test_Hedging(t *testing.T) {
 
 			c, err := NewS3ObjectClient(S3Config{
 				AccessKeyID:     "foo",
-				SecretAccessKey: "bar",
+				SecretAccessKey: flagext.SecretWithValue("bar"),
 				BackoffConfig:   backoff.Config{MaxRetries: 1},
 				BucketNames:     "foo",
 				Inject: func(next http.RoundTripper) http.RoundTripper {
@@ -147,4 +155,68 @@ func Test_Hedging(t *testing.T) {
 			require.Equal(t, tc.expectedCalls, count.Load())
 		})
 	}
+}
+
+func Test_ConfigRedactsCredentials(t *testing.T) {
+	underTest := S3Config{
+		AccessKeyID:     "access key id",
+		SecretAccessKey: flagext.SecretWithValue("secret access key"),
+	}
+
+	output, err := yaml.Marshal(underTest)
+	require.NoError(t, err)
+
+	require.True(t, bytes.Contains(output, []byte("access key id")))
+	require.False(t, bytes.Contains(output, []byte("secret access id")))
+}
+
+func Test_ConfigParsesCredentialsInline(t *testing.T) {
+	var underTest = S3Config{}
+	yamlCfg := `
+access_key_id: access key id
+secret_access_key: secret access key
+`
+	err := yaml.Unmarshal([]byte(yamlCfg), &underTest)
+	require.NoError(t, err)
+
+	require.Equal(t, underTest.AccessKeyID, "access key id")
+	require.Equal(t, underTest.SecretAccessKey.String(), "secret access key")
+	require.Equal(t, underTest.SessionToken.String(), "")
+
+}
+
+func Test_ConfigParsesCredentialsInlineWithSessionToken(t *testing.T) {
+	var underTest = S3Config{}
+	yamlCfg := `
+access_key_id: access key id
+secret_access_key: secret access key
+session_token: session token
+`
+	err := yaml.Unmarshal([]byte(yamlCfg), &underTest)
+	require.NoError(t, err)
+
+	require.Equal(t, underTest.AccessKeyID, "access key id")
+	require.Equal(t, underTest.SecretAccessKey.String(), "secret access key")
+	require.Equal(t, underTest.SessionToken.String(), "session token")
+
+}
+
+type testCommonPrefixesS3Client struct {
+	s3iface.S3API
+}
+
+func (m *testCommonPrefixesS3Client) ListObjectsV2WithContext(aws.Context, *s3.ListObjectsV2Input, ...request.Option) (*s3.ListObjectsV2Output, error) {
+	var commonPrefixes []*s3.CommonPrefix
+	commonPrefix := "common-prefix-repeated/"
+	for i := 0; i < 2; i++ {
+		commonPrefixes = append(commonPrefixes, &s3.CommonPrefix{Prefix: aws.String(commonPrefix)})
+	}
+	return &s3.ListObjectsV2Output{CommonPrefixes: commonPrefixes, IsTruncated: aws.Bool(false)}, nil
+}
+
+func TestCommonPrefixes(t *testing.T) {
+	s3 := S3ObjectClient{S3: &testCommonPrefixesS3Client{}, bucketNames: []string{"bucket"}}
+	_, CommonPrefixes, err := s3.List(context.Background(), "", "/")
+	require.Equal(t, nil, err)
+	require.Equal(t, 1, len(CommonPrefixes))
 }

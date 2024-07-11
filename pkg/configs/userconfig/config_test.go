@@ -18,7 +18,7 @@ import (
 	"github.com/stretchr/testify/require"
 	"gopkg.in/yaml.v3"
 
-	util_log "github.com/grafana/loki/pkg/util/log"
+	util_log "github.com/grafana/loki/v3/pkg/util/log"
 )
 
 var legacyRulesFile = `ALERT TestAlert
@@ -85,6 +85,7 @@ func TestParseLegacyAlerts(t *testing.T) {
 		"TestAlert",
 		parsed,
 		5*time.Minute,
+		0,
 		labels.Labels{
 			labels.Label{Name: "severity", Value: "critical"},
 		},

@@ -7,37 +7,57 @@ import (
 	"fmt"
 	"math"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
+
+	"github.com/opentracing/opentracing-go"
+
+	"github.com/grafana/loki/v3/pkg/logqlmodel/metadata"
 
 	"github.com/go-kit/log"
 	"github.com/go-kit/log/level"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promauto"
+	"github.com/prometheus/common/model"
 	"github.com/prometheus/prometheus/model/labels"
 	"github.com/prometheus/prometheus/promql"
 	promql_parser "github.com/prometheus/prometheus/promql/parser"
 
 	"github.com/grafana/dskit/tenant"
 
-	"github.com/grafana/loki/pkg/iter"
-	"github.com/grafana/loki/pkg/logproto"
-	"github.com/grafana/loki/pkg/logql/syntax"
-	"github.com/grafana/loki/pkg/logqlmodel"
-	"github.com/grafana/loki/pkg/logqlmodel/stats"
-	"github.com/grafana/loki/pkg/util"
-	"github.com/grafana/loki/pkg/util/httpreq"
-	"github.com/grafana/loki/pkg/util/spanlogger"
-	"github.com/grafana/loki/pkg/util/validation"
+	"github.com/grafana/loki/v3/pkg/iter"
+	"github.com/grafana/loki/v3/pkg/logproto"
+	"github.com/grafana/loki/v3/pkg/logql/syntax"
+	"github.com/grafana/loki/v3/pkg/logqlmodel"
+	"github.com/grafana/loki/v3/pkg/logqlmodel/stats"
+	"github.com/grafana/loki/v3/pkg/util"
+	"github.com/grafana/loki/v3/pkg/util/constants"
+	"github.com/grafana/loki/v3/pkg/util/httpreq"
+	logutil "github.com/grafana/loki/v3/pkg/util/log"
+	"github.com/grafana/loki/v3/pkg/util/server"
+	"github.com/grafana/loki/v3/pkg/util/spanlogger"
+	"github.com/grafana/loki/v3/pkg/util/validation"
+)
+
+const (
+	DefaultBlockedQueryMessage = "blocked by policy"
 )
 
 var (
-	queryTime = promauto.NewHistogramVec(prometheus.HistogramOpts{
+	QueryTime = promauto.NewHistogramVec(prometheus.HistogramOpts{
 		Namespace: "logql",
 		Name:      "query_duration_seconds",
 		Help:      "LogQL query timings",
 		Buckets:   prometheus.DefBuckets,
 	}, []string{"query_type"})
+
+	QueriesBlocked = promauto.NewCounterVec(prometheus.CounterOpts{
+		Namespace: constants.Loki,
+		Name:      "blocked_queries",
+		Help:      "Count of queries blocked by per-tenant policy",
+	}, []string{"user"})
+
 	lastEntryMinTime = time.Unix(-100, 0)
 )
 
@@ -53,6 +73,12 @@ type SelectLogParams struct {
 	*logproto.QueryRequest
 }
 
+func (s SelectLogParams) WithStoreChunks(chunkRefGroup *logproto.ChunkRefGroup) SelectLogParams {
+	cpy := *s.QueryRequest
+	cpy.StoreChunks = chunkRefGroup
+	return SelectLogParams{&cpy}
+}
+
 func (s SelectLogParams) String() string {
 	if s.QueryRequest != nil {
 		return fmt.Sprintf("selector=%s, direction=%s, start=%s, end=%s, limit=%d, shards=%s",
@@ -64,27 +90,47 @@ func (s SelectLogParams) String() string {
 // LogSelector returns the LogSelectorExpr from the SelectParams.
 // The `LogSelectorExpr` can then returns all matchers and filters to use for that request.
 func (s SelectLogParams) LogSelector() (syntax.LogSelectorExpr, error) {
-	return syntax.ParseLogSelector(s.Selector, true)
+	if s.QueryRequest.Plan == nil {
+		return nil, errors.New("query plan is empty")
+	}
+	expr, ok := s.QueryRequest.Plan.AST.(syntax.LogSelectorExpr)
+	if !ok {
+		return nil, errors.New("only log selector is supported")
+	}
+	return expr, nil
 }
 
 type SelectSampleParams struct {
 	*logproto.SampleQueryRequest
 }
 
+func (s SelectSampleParams) WithStoreChunks(chunkRefGroup *logproto.ChunkRefGroup) SelectSampleParams {
+	cpy := *s.SampleQueryRequest
+	cpy.StoreChunks = chunkRefGroup
+	return SelectSampleParams{&cpy}
+}
+
 // Expr returns the SampleExpr from the SelectSampleParams.
 // The `LogSelectorExpr` can then returns all matchers and filters to use for that request.
 func (s SelectSampleParams) Expr() (syntax.SampleExpr, error) {
-	return syntax.ParseSampleExpr(s.Selector)
+	if s.SampleQueryRequest.Plan == nil {
+		return nil, errors.New("query plan is empty")
+	}
+	expr, ok := s.SampleQueryRequest.Plan.AST.(syntax.SampleExpr)
+	if !ok {
+		return nil, errors.New("only sample expression supported")
+	}
+	return expr, nil
 }
 
 // LogSelector returns the LogSelectorExpr from the SelectParams.
 // The `LogSelectorExpr` can then returns all matchers and filters to use for that request.
 func (s SelectSampleParams) LogSelector() (syntax.LogSelectorExpr, error) {
-	expr, err := syntax.ParseSampleExpr(s.Selector)
+	expr, err := s.Expr()
 	if err != nil {
 		return nil, err
 	}
-	return expr.Selector(), nil
+	return expr.Selector()
 }
 
 // Querier allows a LogQL expression to fetch an EntryIterator for a
@@ -96,22 +142,21 @@ type Querier interface {
 
 // EngineOpts is the list of options to use with the LogQL query engine.
 type EngineOpts struct {
-	// Timeout for queries execution
-	Timeout time.Duration `yaml:"timeout"`
 	// MaxLookBackPeriod is the maximum amount of time to look back for log lines.
 	// only used for instant log queries.
 	MaxLookBackPeriod time.Duration `yaml:"max_look_back_period"`
+
+	// LogExecutingQuery will control if we log the query when Exec is called.
+	LogExecutingQuery bool `yaml:"-"`
 }
 
 func (opts *EngineOpts) RegisterFlagsWithPrefix(prefix string, f *flag.FlagSet) {
-	f.DurationVar(&opts.Timeout, prefix+".engine.timeout", 5*time.Minute, "Timeout for query execution.")
 	f.DurationVar(&opts.MaxLookBackPeriod, prefix+".engine.max-lookback-period", 30*time.Second, "The maximum amount of time to look back for log lines. Used only for instant log queries.")
+	// Log executing query by default
+	opts.LogExecutingQuery = true
 }
 
 func (opts *EngineOpts) applyDefault() {
-	if opts.Timeout == 0 {
-		opts.Timeout = 5 * time.Minute
-	}
 	if opts.MaxLookBackPeriod == 0 {
 		opts.MaxLookBackPeriod = 30 * time.Second
 	}
@@ -119,10 +164,10 @@ func (opts *EngineOpts) applyDefault() {
 
 // Engine is the LogQL engine.
 type Engine struct {
-	logger    log.Logger
-	timeout   time.Duration
-	evaluator Evaluator
-	limits    Limits
+	logger           log.Logger
+	evaluatorFactory EvaluatorFactory
+	limits           Limits
+	opts             EngineOpts
 }
 
 // NewEngine creates a new LogQL Engine.
@@ -132,25 +177,22 @@ func NewEngine(opts EngineOpts, q Querier, l Limits, logger log.Logger) *Engine 
 		logger = log.NewNopLogger()
 	}
 	return &Engine{
-		logger:    logger,
-		timeout:   opts.Timeout,
-		evaluator: NewDefaultEvaluator(q, opts.MaxLookBackPeriod),
-		limits:    l,
+		logger:           logger,
+		evaluatorFactory: NewDefaultEvaluator(q, opts.MaxLookBackPeriod),
+		limits:           l,
+		opts:             opts,
 	}
 }
 
 // Query creates a new LogQL query. Instant/Range type is derived from the parameters.
 func (ng *Engine) Query(params Params) Query {
 	return &query{
-		logger:    ng.logger,
-		timeout:   ng.timeout,
-		params:    params,
-		evaluator: ng.evaluator,
-		parse: func(_ context.Context, query string) (syntax.Expr, error) {
-			return syntax.ParseExpr(query)
-		},
-		record: true,
-		limits: ng.limits,
+		logger:       ng.logger,
+		params:       params,
+		evaluator:    ng.evaluatorFactory,
+		record:       true,
+		logExecQuery: ng.opts.LogExecutingQuery,
+		limits:       ng.limits,
 	}
 }
 
@@ -161,82 +203,130 @@ type Query interface {
 }
 
 type query struct {
-	logger    log.Logger
-	timeout   time.Duration
-	params    Params
-	parse     func(context.Context, string) (syntax.Expr, error)
-	limits    Limits
-	evaluator Evaluator
-	record    bool
+	logger       log.Logger
+	params       Params
+	limits       Limits
+	evaluator    EvaluatorFactory
+	record       bool
+	logExecQuery bool
+}
+
+func (q *query) resultLength(res promql_parser.Value) int {
+	switch r := res.(type) {
+	case promql.Vector:
+		return len(r)
+	case promql.Matrix:
+		return r.TotalSamples()
+	case logqlmodel.Streams:
+		return int(r.Lines())
+	case ProbabilisticQuantileMatrix:
+		return len(r)
+	default:
+		// for `scalar` or `string` or any other return type, we just return `0` as result length.
+		return 0
+	}
 }
 
 // Exec Implements `Query`. It handles instrumentation & defers to Eval.
 func (q *query) Exec(ctx context.Context) (logqlmodel.Result, error) {
-	log, ctx := spanlogger.New(ctx, "query.Exec")
-	defer log.Finish()
+	sp, ctx := opentracing.StartSpanFromContext(ctx, "query.Exec")
+	defer sp.Finish()
+	spLogger := spanlogger.FromContext(ctx)
+
+	sp.LogKV(
+		"type", GetRangeType(q.params),
+		"query", q.params.QueryString(),
+		"start", q.params.Start(),
+		"end", q.params.End(),
+		"step", q.params.Step(),
+		"length", q.params.End().Sub(q.params.Start()),
+	)
+
+	if q.logExecQuery {
+		queryHash := util.HashedQuery(q.params.QueryString())
+		if GetRangeType(q.params) == InstantType {
+			level.Info(logutil.WithContext(ctx, q.logger)).Log("msg", "executing query", "type", "instant", "query", q.params.QueryString(), "query_hash", queryHash)
+		} else {
+			level.Info(logutil.WithContext(ctx, q.logger)).Log("msg", "executing query", "type", "range", "query", q.params.QueryString(), "length", q.params.End().Sub(q.params.Start()), "step", q.params.Step(), "query_hash", queryHash)
+		}
+	}
 
 	rangeType := GetRangeType(q.params)
-	timer := prometheus.NewTimer(queryTime.WithLabelValues(string(rangeType)))
+	timer := prometheus.NewTimer(QueryTime.WithLabelValues(string(rangeType)))
 	defer timer.ObserveDuration()
 
 	// records query statistics
 	start := time.Now()
 	statsCtx, ctx := stats.NewContext(ctx)
+	metadataCtx, ctx := metadata.NewContext(ctx)
 
 	data, err := q.Eval(ctx)
 
 	queueTime, _ := ctx.Value(httpreq.QueryQueueTimeHTTPHeader).(time.Duration)
 
-	statResult := statsCtx.Result(time.Since(start), queueTime)
-	statResult.Log(level.Debug(log))
+	statResult := statsCtx.Result(time.Since(start), queueTime, q.resultLength(data))
+	statResult.Log(level.Debug(spLogger))
 
-	status := "200"
-	if err != nil {
-		status = "500"
-		if errors.Is(err, logqlmodel.ErrParse) ||
-			errors.Is(err, logqlmodel.ErrPipeline) ||
-			errors.Is(err, logqlmodel.ErrLimit) ||
-			errors.Is(err, context.Canceled) {
-			status = "400"
-		}
-	}
+	status, _ := server.ClientHTTPStatusAndError(err)
 
 	if q.record {
-		RecordMetrics(ctx, q.logger, q.params, status, statResult, data)
+		RecordRangeAndInstantQueryMetrics(ctx, q.logger, q.params, strconv.Itoa(status), statResult, data)
 	}
 
 	return logqlmodel.Result{
 		Data:       data,
 		Statistics: statResult,
+		Headers:    metadataCtx.Headers(),
+		Warnings:   metadataCtx.Warnings(),
 	}, err
 }
 
 func (q *query) Eval(ctx context.Context) (promql_parser.Value, error) {
-	ctx, cancel := context.WithTimeout(ctx, q.timeout)
+	tenants, _ := tenant.TenantIDs(ctx)
+	timeoutCapture := func(id string) time.Duration { return q.limits.QueryTimeout(ctx, id) }
+	queryTimeout := validation.SmallestPositiveNonZeroDurationPerTenant(tenants, timeoutCapture)
+	ctx, cancel := context.WithTimeout(ctx, queryTimeout)
 	defer cancel()
 
-	expr, err := q.parse(ctx, q.params.Query())
-	if err != nil {
-		return nil, err
+	if q.checkBlocked(ctx, tenants) {
+		return nil, logqlmodel.ErrBlocked
 	}
 
-	switch e := expr.(type) {
+	switch e := q.params.GetExpression().(type) {
 	case syntax.SampleExpr:
 		value, err := q.evalSample(ctx, e)
 		return value, err
 
 	case syntax.LogSelectorExpr:
-		iter, err := q.evaluator.Iterator(ctx, e, q.params)
+		itr, err := q.evaluator.NewIterator(ctx, e, q.params)
 		if err != nil {
 			return nil, err
 		}
 
-		defer util.LogErrorWithContext(ctx, "closing iterator", iter.Close)
-		streams, err := readStreams(iter, q.params.Limit(), q.params.Direction(), q.params.Interval())
+		encodingFlags := httpreq.ExtractEncodingFlagsFromCtx(ctx)
+		if encodingFlags.Has(httpreq.FlagCategorizeLabels) {
+			itr = iter.NewCategorizeLabelsIterator(itr)
+		}
+
+		defer util.LogErrorWithContext(ctx, "closing iterator", itr.Close)
+		streams, err := readStreams(itr, q.params.Limit(), q.params.Direction(), q.params.Interval())
 		return streams, err
 	default:
-		return nil, errors.New("Unexpected type (%T): cannot evaluate")
+		return nil, fmt.Errorf("unexpected type (%T): cannot evaluate", e)
 	}
+}
+
+func (q *query) checkBlocked(ctx context.Context, tenants []string) bool {
+	blocker := newQueryBlocker(ctx, q)
+
+	for _, tenant := range tenants {
+		if blocker.isBlocked(ctx, tenant) {
+			QueriesBlocked.WithLabelValues(tenant).Inc()
+			return true
+		}
+	}
+
+	return false
 }
 
 // evalSample evaluate a sampleExpr
@@ -244,28 +334,62 @@ func (q *query) evalSample(ctx context.Context, expr syntax.SampleExpr) (promql_
 	if lit, ok := expr.(*syntax.LiteralExpr); ok {
 		return q.evalLiteral(ctx, lit)
 	}
-
-	expr, err := optimizeSampleExpr(expr)
-	if err != nil {
-		return nil, err
+	if vec, ok := expr.(*syntax.VectorExpr); ok {
+		return q.evalVector(ctx, vec)
 	}
-
-	stepEvaluator, err := q.evaluator.StepEvaluator(ctx, q.evaluator, expr, q.params)
-	if err != nil {
-		return nil, err
-	}
-	defer util.LogErrorWithContext(ctx, "closing SampleExpr", stepEvaluator.Close)
 
 	tenantIDs, err := tenant.TenantIDs(ctx)
 	if err != nil {
 		return nil, err
 	}
-	maxSeries := validation.SmallestPositiveIntPerTenant(tenantIDs, q.limits.MaxQuerySeries)
-	seriesIndex := map[uint64]*promql.Series{}
 
-	next, ts, vec := stepEvaluator.Next()
+	maxIntervalCapture := func(id string) time.Duration { return q.limits.MaxQueryRange(ctx, id) }
+	maxQueryInterval := validation.SmallestPositiveNonZeroDurationPerTenant(tenantIDs, maxIntervalCapture)
+	if maxQueryInterval != 0 {
+		err = q.checkIntervalLimit(expr, maxQueryInterval)
+		if err != nil {
+			return nil, err
+		}
+	}
+
+	expr, err = optimizeSampleExpr(expr)
+	if err != nil {
+		return nil, err
+	}
+
+	stepEvaluator, err := q.evaluator.NewStepEvaluator(ctx, q.evaluator, expr, q.params)
+	if err != nil {
+		return nil, err
+	}
+	defer util.LogErrorWithContext(ctx, "closing SampleExpr", stepEvaluator.Close)
+
+	next, _, r := stepEvaluator.Next()
 	if stepEvaluator.Error() != nil {
 		return nil, stepEvaluator.Error()
+	}
+
+	if next && r != nil {
+		switch vec := r.(type) {
+		case SampleVector:
+			maxSeriesCapture := func(id string) int { return q.limits.MaxQuerySeries(ctx, id) }
+			maxSeries := validation.SmallestPositiveIntPerTenant(tenantIDs, maxSeriesCapture)
+			return q.JoinSampleVector(next, vec, stepEvaluator, maxSeries)
+		case ProbabilisticQuantileVector:
+			return MergeQuantileSketchVector(next, vec, stepEvaluator, q.params)
+		default:
+			return nil, fmt.Errorf("unsupported result type: %T", r)
+		}
+	}
+	return nil, nil
+}
+
+func (q *query) JoinSampleVector(next bool, r StepResult, stepEvaluator StepEvaluator, maxSeries int) (promql_parser.Value, error) {
+
+	seriesIndex := map[uint64]*promql.Series{}
+
+	vec := promql.Vector{}
+	if next {
+		vec = r.SampleVector()
 	}
 
 	// fail fast for the first step or instant query
@@ -274,7 +398,13 @@ func (q *query) evalSample(ctx context.Context, expr syntax.SampleExpr) (promql_
 	}
 
 	if GetRangeType(q.params) == InstantType {
-		sort.Slice(vec, func(i, j int) bool { return labels.Compare(vec[i].Metric, vec[j].Metric) < 0 })
+		sortByValue, err := Sortable(q.params)
+		if err != nil {
+			return nil, fmt.Errorf("fail to check Sortable, logql: %s ,err: %s", q.params.QueryString(), err)
+		}
+		if !sortByValue {
+			sort.Slice(vec, func(i, j int) bool { return labels.Compare(vec[i].Metric, vec[j].Metric) < 0 })
+		}
 		return vec, nil
 	}
 
@@ -284,6 +414,7 @@ func (q *query) evalSample(ctx context.Context, expr syntax.SampleExpr) (promql_
 	}
 
 	for next {
+		vec = r.SampleVector()
 		for _, p := range vec {
 			var (
 				series *promql.Series
@@ -295,20 +426,20 @@ func (q *query) evalSample(ctx context.Context, expr syntax.SampleExpr) (promql_
 			if !ok {
 				series = &promql.Series{
 					Metric: p.Metric,
-					Points: make([]promql.Point, 0, stepCount),
+					Floats: make([]promql.FPoint, 0, stepCount),
 				}
 				seriesIndex[hash] = series
 			}
-			series.Points = append(series.Points, promql.Point{
-				T: ts,
-				V: p.V,
+			series.Floats = append(series.Floats, promql.FPoint{
+				T: p.T,
+				F: p.F,
 			})
 		}
 		// as we slowly build the full query for each steps, make sure we don't go over the limit of unique series.
 		if len(seriesIndex) > maxSeries {
 			return nil, logqlmodel.NewSeriesLimitError(maxSeries)
 		}
-		next, ts, vec = stepEvaluator.Next()
+		next, _, r = stepEvaluator.Next()
 		if stepEvaluator.Error() != nil {
 			return nil, stepEvaluator.Error()
 		}
@@ -324,14 +455,53 @@ func (q *query) evalSample(ctx context.Context, expr syntax.SampleExpr) (promql_
 	return result, stepEvaluator.Error()
 }
 
+func (q *query) checkIntervalLimit(expr syntax.SampleExpr, limit time.Duration) error {
+	var err error
+	expr.Walk(func(e syntax.Expr) {
+		switch e := e.(type) {
+		case *syntax.RangeAggregationExpr:
+			if e.Left == nil || e.Left.Interval <= limit {
+				return
+			}
+			err = fmt.Errorf("%w: [%s] > [%s]", logqlmodel.ErrIntervalLimit, model.Duration(e.Left.Interval), model.Duration(limit))
+		}
+	})
+	return err
+}
+
 func (q *query) evalLiteral(_ context.Context, expr *syntax.LiteralExpr) (promql_parser.Value, error) {
+	value, err := expr.Value()
+	if err != nil {
+		return nil, err
+	}
 	s := promql.Scalar{
 		T: q.params.Start().UnixNano() / int64(time.Millisecond),
-		V: expr.Value(),
+		V: value,
 	}
 
 	if GetRangeType(q.params) == InstantType {
 		return s, nil
+	}
+
+	return PopulateMatrixFromScalar(s, q.params), nil
+}
+
+func (q *query) evalVector(_ context.Context, expr *syntax.VectorExpr) (promql_parser.Value, error) {
+	value, err := expr.Value()
+	if err != nil {
+		return nil, err
+	}
+	s := promql.Scalar{
+		T: q.params.Start().UnixNano() / int64(time.Millisecond),
+		V: value,
+	}
+
+	if GetRangeType(q.params) == InstantType {
+		return promql.Vector{promql.Sample{
+			T:      q.params.Start().UnixMilli(),
+			F:      value,
+			Metric: labels.Labels{},
+		}}, nil
 	}
 
 	return PopulateMatrixFromScalar(s, q.params), nil
@@ -343,8 +513,8 @@ func PopulateMatrixFromScalar(data promql.Scalar, params Params) promql.Matrix {
 		end    = params.End()
 		step   = params.Step()
 		series = promql.Series{
-			Points: make(
-				[]promql.Point,
+			Floats: make(
+				[]promql.FPoint,
 				0,
 				// allocate enough space for all needed entries
 				int(end.Sub(start)/step)+1,
@@ -353,14 +523,18 @@ func PopulateMatrixFromScalar(data promql.Scalar, params Params) promql.Matrix {
 	)
 
 	for ts := start; !ts.After(end); ts = ts.Add(step) {
-		series.Points = append(series.Points, promql.Point{
+		series.Floats = append(series.Floats, promql.FPoint{
 			T: ts.UnixNano() / int64(time.Millisecond),
-			V: data.V,
+			F: data.V,
 		})
 	}
 	return promql.Matrix{series}
 }
 
+// readStreams reads the streams from the iterator and returns them sorted.
+// If categorizeLabels is true, the stream labels contains just the stream labels and entries inside each stream have their
+// structuredMetadata and parsed fields populated with structured metadata labels plus the parsed labels respectively.
+// Otherwise, the stream labels are the whole series labels including the stream labels, structured metadata labels and parsed labels.
 func readStreams(i iter.EntryIterator, size uint32, dir logproto.Direction, interval time.Duration) (logqlmodel.Streams, error) {
 	streams := map[string]*logproto.Stream{}
 	respSize := uint32(0)
@@ -368,21 +542,23 @@ func readStreams(i iter.EntryIterator, size uint32, dir logproto.Direction, inte
 	// value here because many unit tests start at time.Unix(0,0)
 	lastEntry := lastEntryMinTime
 	for respSize < size && i.Next() {
-		labels, entry := i.Labels(), i.Entry()
+		streamLabels, entry := i.Labels(), i.Entry()
+
 		forwardShouldOutput := dir == logproto.FORWARD &&
-			(i.Entry().Timestamp.Equal(lastEntry.Add(interval)) || i.Entry().Timestamp.After(lastEntry.Add(interval)))
+			(entry.Timestamp.Equal(lastEntry.Add(interval)) || entry.Timestamp.After(lastEntry.Add(interval)))
 		backwardShouldOutput := dir == logproto.BACKWARD &&
-			(i.Entry().Timestamp.Equal(lastEntry.Add(-interval)) || i.Entry().Timestamp.Before(lastEntry.Add(-interval)))
+			(entry.Timestamp.Equal(lastEntry.Add(-interval)) || entry.Timestamp.Before(lastEntry.Add(-interval)))
+
 		// If step == 0 output every line.
 		// If lastEntry.Unix < 0 this is the first pass through the loop and we should output the line.
 		// Then check to see if the entry is equal to, or past a forward or reverse step
 		if interval == 0 || lastEntry.Unix() < 0 || forwardShouldOutput || backwardShouldOutput {
-			stream, ok := streams[labels]
+			stream, ok := streams[streamLabels]
 			if !ok {
 				stream = &logproto.Stream{
-					Labels: labels,
+					Labels: streamLabels,
 				}
-				streams[labels] = stream
+				streams[streamLabels] = stream
 			}
 			stream.Entries = append(stream.Entries, entry)
 			lastEntry = i.Entry().Timestamp

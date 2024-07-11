@@ -2,31 +2,34 @@ package main
 
 import (
 	"flag"
-	"net/http"
-	"net/http/pprof"
 	"os"
 
-	"github.com/ViaQ/logerr/kverrors"
-	"github.com/ViaQ/logerr/log"
-
-	// Import all Kubernetes client auth plugins (e.g. Azure, GCP, OIDC, etc.)
-	// to ensure that exec-entrypoint and run can make use of them.
-	_ "k8s.io/client-go/plugin/pkg/client/auth"
-
-	lokiv1beta1 "github.com/grafana/loki/operator/api/v1beta1"
-	"github.com/grafana/loki/operator/controllers"
-	"github.com/grafana/loki/operator/internal/manifests"
-	"github.com/grafana/loki/operator/internal/metrics"
+	"github.com/ViaQ/logerr/v2/kverrors"
+	"github.com/ViaQ/logerr/v2/log"
 	configv1 "github.com/openshift/api/config/v1"
 	routev1 "github.com/openshift/api/route/v1"
+	cloudcredentialv1 "github.com/openshift/cloud-credential-operator/pkg/apis/cloudcredential/v1"
 	monitoringv1 "github.com/prometheus-operator/prometheus-operator/pkg/apis/monitoring/v1"
-
 	"k8s.io/apimachinery/pkg/runtime"
 	utilruntime "k8s.io/apimachinery/pkg/util/runtime"
 	clientgoscheme "k8s.io/client-go/kubernetes/scheme"
 	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/healthz"
-	// +kubebuilder:scaffold:imports
+	runtimemetrics "sigs.k8s.io/controller-runtime/pkg/metrics"
+
+	ctrlconfigv1 "github.com/grafana/loki/operator/apis/config/v1"
+	lokiv1 "github.com/grafana/loki/operator/apis/loki/v1"
+	lokiv1beta1 "github.com/grafana/loki/operator/apis/loki/v1beta1"
+	lokictrl "github.com/grafana/loki/operator/controllers/loki"
+	"github.com/grafana/loki/operator/internal/config"
+	"github.com/grafana/loki/operator/internal/metrics"
+	"github.com/grafana/loki/operator/internal/operator"
+	"github.com/grafana/loki/operator/internal/validation"
+	"github.com/grafana/loki/operator/internal/validation/openshift"
+
+	// Import all Kubernetes client auth plugins (e.g. Azure, GCP, OIDC, etc.)
+	// to ensure that exec-entrypoint and run can make use of them.
+	_ "k8s.io/client-go/plugin/pkg/client/auth"
 )
 
 var scheme = runtime.NewScheme()
@@ -35,92 +38,173 @@ func init() {
 	utilruntime.Must(clientgoscheme.AddToScheme(scheme))
 
 	utilruntime.Must(lokiv1beta1.AddToScheme(scheme))
+
+	utilruntime.Must(lokiv1.AddToScheme(scheme))
+
+	utilruntime.Must(ctrlconfigv1.AddToScheme(scheme))
+
 	// +kubebuilder:scaffold:scheme
 }
 
 func main() {
-	var (
-		metricsAddr                string
-		enableLeaderElection       bool
-		probeAddr                  string
-		enableCertSigning          bool
-		enableServiceMonitors      bool
-		enableTLSServiceMonitors   bool
-		enableGateway              bool
-		enableGatewayRoute         bool
-		enablePrometheusAlerts     bool
-		enableGrafanaLabsAnalytics bool
+	var configFile string
+	flag.StringVar(&configFile, "config", "",
+		"The controller will load its initial configuration from this file. "+
+			"Omit this flag to use the default configuration values. "+
+			"Command-line flags override configuration from this file.",
 	)
-
-	flag.StringVar(&metricsAddr, "metrics-bind-address", ":8080", "The address the metric endpoint binds to.")
-	flag.StringVar(&probeAddr, "health-probe-bind-address", ":8081", "The address the probe endpoint binds to.")
-	flag.BoolVar(&enableLeaderElection, "leader-elect", false,
-		"Enable leader election for controller manager. "+
-			"Enabling this will ensure there is only one active controller manager.")
-	flag.BoolVar(&enableCertSigning, "with-cert-signing-service", false,
-		"Enables features in an Openshift cluster.")
-	flag.BoolVar(&enableServiceMonitors, "with-service-monitors", false, "Enables service monitoring")
-	flag.BoolVar(&enableTLSServiceMonitors, "with-tls-service-monitors", false,
-		"Enables loading of a prometheus service monitor.")
-	flag.BoolVar(&enableGateway, "with-lokistack-gateway", false,
-		"Enables the manifest creation for the entire lokistack-gateway.")
-	flag.BoolVar(&enableGatewayRoute, "with-lokistack-gateway-route", false,
-		"Enables the usage of Route for the lokistack-gateway instead of Ingress (OCP Only!).")
-	flag.BoolVar(&enablePrometheusAlerts, "with-prometheus-alerts", false, "Enables prometheus alerts.")
-	flag.BoolVar(&enableGrafanaLabsAnalytics, "with-grafana-labs-analytics", true,
-		"Enables Grafana Labs analytics.\nMore info: https://grafana.com/docs/loki/latest/configuration/#analytics")
 	flag.Parse()
 
 	logger := log.NewLogger("loki-operator")
 	ctrl.SetLogger(logger)
 
-	if enablePrometheusAlerts && !enableServiceMonitors {
-		logger.Error(kverrors.New("-with-prometheus-alerts flag requires -with-service-monitors"), "")
+	var err error
+
+	ctrlCfg, tokenCCOAuth, options, err := config.LoadConfig(scheme, configFile)
+	if err != nil {
+		logger.Error(err, "failed to load operator configuration")
 		os.Exit(1)
 	}
 
-	if enableServiceMonitors || enableTLSServiceMonitors {
+	if tokenCCOAuth != nil {
+		logger.Info("Discovered OpenShift Cluster within a token cco authentication environment")
+	}
+
+	if ctrlCfg.Gates.LokiStackAlerts && !ctrlCfg.Gates.ServiceMonitors {
+		logger.Error(kverrors.New("LokiStackAlerts flag requires ServiceMonitors"), "")
+		os.Exit(1)
+	}
+
+	if ctrlCfg.Gates.ServiceMonitorTLSEndpoints && !ctrlCfg.Gates.HTTPEncryption {
+		logger.Error(kverrors.New("ServiceMonitorTLSEndpoints flag requires HTTPEncryption"), "")
+		os.Exit(1)
+	}
+
+	if ctrlCfg.Gates.ServiceMonitors || ctrlCfg.Gates.ServiceMonitorTLSEndpoints {
 		utilruntime.Must(monitoringv1.AddToScheme(scheme))
 	}
 
-	if enableGateway {
+	if ctrlCfg.Gates.LokiStackGateway {
 		utilruntime.Must(configv1.AddToScheme(scheme))
 
-		if enableGatewayRoute {
+		if ctrlCfg.Gates.OpenShift.Enabled {
 			utilruntime.Must(routev1.AddToScheme(scheme))
+			utilruntime.Must(cloudcredentialv1.AddToScheme(scheme))
 		}
 	}
 
-	mgr, err := ctrl.NewManager(ctrl.GetConfigOrDie(), ctrl.Options{
-		Scheme:                 scheme,
-		MetricsBindAddress:     metricsAddr,
-		Port:                   9443,
-		HealthProbeBindAddress: probeAddr,
-		LeaderElection:         enableLeaderElection,
-		LeaderElectionID:       "e3716011.grafana.com",
-	})
+	mgr, err := ctrl.NewManager(ctrl.GetConfigOrDie(), options)
 	if err != nil {
 		logger.Error(err, "unable to start manager")
 		os.Exit(1)
 	}
 
-	featureFlags := manifests.FeatureFlags{
-		EnableCertificateSigningService: enableCertSigning,
-		EnableServiceMonitors:           enableServiceMonitors,
-		EnableTLSServiceMonitorConfig:   enableTLSServiceMonitors,
-		EnablePrometheusAlerts:          enablePrometheusAlerts,
-		EnableGateway:                   enableGateway,
-		EnableGatewayRoute:              enableGatewayRoute,
-		EnableGrafanaLabsStats:          enableGrafanaLabsAnalytics,
+	if err = (&lokictrl.LokiStackReconciler{
+		Client:       mgr.GetClient(),
+		Log:          logger.WithName("controllers").WithName("lokistack"),
+		Scheme:       mgr.GetScheme(),
+		FeatureGates: ctrlCfg.Gates,
+		AuthConfig:   tokenCCOAuth,
+	}).SetupWithManager(mgr); err != nil {
+		logger.Error(err, "unable to create controller", "controller", "lokistack")
+		os.Exit(1)
 	}
 
-	if err = (&controllers.LokiStackReconciler{
+	if ctrlCfg.Gates.ServiceMonitors && ctrlCfg.Gates.OpenShift.Enabled && ctrlCfg.Gates.OpenShift.Dashboards {
+		var ns string
+		ns, err = operator.GetNamespace()
+		if err != nil {
+			logger.Error(err, "unable to read in operator namespace")
+			os.Exit(1)
+		}
+
+		if err = (&lokictrl.DashboardsReconciler{
+			Client:     mgr.GetClient(),
+			Scheme:     mgr.GetScheme(),
+			Log:        logger.WithName("controllers").WithName("lokistack-dashboards"),
+			OperatorNs: ns,
+		}).SetupWithManager(mgr); err != nil {
+			logger.Error(err, "unable to create controller", "controller", "lokistack-dashboards")
+			os.Exit(1)
+		}
+	}
+
+	if ctrlCfg.Gates.LokiStackWebhook {
+		v := &validation.LokiStackValidator{}
+		if err = v.SetupWebhookWithManager(mgr); err != nil {
+			logger.Error(err, "unable to create webhook", "webhook", "lokistack")
+			os.Exit(1)
+		}
+	}
+	if err = (&lokictrl.AlertingRuleReconciler{
 		Client: mgr.GetClient(),
-		Log:    logger.WithName("controllers").WithName("LokiStack"),
+		Log:    logger.WithName("controllers").WithName("alertingrule"),
 		Scheme: mgr.GetScheme(),
-		Flags:  featureFlags,
 	}).SetupWithManager(mgr); err != nil {
-		logger.Error(err, "unable to create controller", "controller", "LokiStack")
+		logger.Error(err, "unable to create controller", "controller", "alertingrule")
+		os.Exit(1)
+	}
+	if ctrlCfg.Gates.AlertingRuleWebhook {
+		v := &validation.AlertingRuleValidator{}
+		if ctrlCfg.Gates.OpenShift.ExtendedRuleValidation {
+			v.ExtendedValidator = openshift.AlertingRuleValidator
+		}
+
+		if err = v.SetupWebhookWithManager(mgr); err != nil {
+			logger.Error(err, "unable to create webhook", "webhook", "alertingrule")
+			os.Exit(1)
+		}
+	}
+	if err = (&lokictrl.RecordingRuleReconciler{
+		Client: mgr.GetClient(),
+		Log:    logger.WithName("controllers").WithName("recordingrule"),
+		Scheme: mgr.GetScheme(),
+	}).SetupWithManager(mgr); err != nil {
+		logger.Error(err, "unable to create controller", "controller", "recordingrule")
+		os.Exit(1)
+	}
+	if ctrlCfg.Gates.RecordingRuleWebhook {
+		v := &validation.RecordingRuleValidator{}
+		if ctrlCfg.Gates.OpenShift.ExtendedRuleValidation {
+			v.ExtendedValidator = openshift.RecordingRuleValidator
+		}
+
+		if err = v.SetupWebhookWithManager(mgr); err != nil {
+			logger.Error(err, "unable to create webhook", "webhook", "recordingrule")
+			os.Exit(1)
+		}
+	}
+	if err = (&lokictrl.RulerConfigReconciler{
+		Client: mgr.GetClient(),
+		Scheme: mgr.GetScheme(),
+	}).SetupWithManager(mgr); err != nil {
+		logger.Error(err, "unable to create controller", "controller", "rulerconfig")
+		os.Exit(1)
+	}
+	if ctrlCfg.Gates.RulerConfigWebhook {
+		v := &validation.RulerConfigValidator{}
+		if err = v.SetupWebhookWithManager(mgr); err != nil {
+			logger.Error(err, "unable to create webhook", "webhook", "rulerconfig")
+			os.Exit(1)
+		}
+	}
+	if ctrlCfg.Gates.BuiltInCertManagement.Enabled {
+		if err = (&lokictrl.CertRotationReconciler{
+			Client:       mgr.GetClient(),
+			Log:          logger.WithName("controllers").WithName("certrotation"),
+			Scheme:       mgr.GetScheme(),
+			FeatureGates: ctrlCfg.Gates,
+		}).SetupWithManager(mgr); err != nil {
+			logger.Error(err, "unable to create controller", "controller", "certrotation")
+			os.Exit(1)
+		}
+	}
+
+	if err = (&lokictrl.LokiStackZoneAwarePodReconciler{
+		Client: mgr.GetClient(),
+		Log:    logger.WithName("controllers").WithName("lokistack-zoneaware-pod"),
+	}).SetupWithManager(mgr); err != nil {
+		logger.Error(err, "unable to create controller", "controller", "lokistack-zoneaware-pod")
 		os.Exit(1)
 	}
 	// +kubebuilder:scaffold:builder
@@ -135,12 +219,9 @@ func main() {
 	}
 
 	logger.Info("registering metrics")
-	metrics.RegisterMetricCollectors()
-
-	logger.Info("Registering profiling endpoints.")
-	err = registerProfiler(mgr)
+	err = metrics.RegisterLokiStackCollector(logger, mgr.GetClient(), runtimemetrics.Registry)
 	if err != nil {
-		logger.Error(err, "failed to register extra pprof handler")
+		logger.Error(err, "failed to register metrics")
 		os.Exit(1)
 	}
 
@@ -149,23 +230,4 @@ func main() {
 		logger.Error(err, "problem running manager")
 		os.Exit(1)
 	}
-}
-
-func registerProfiler(m ctrl.Manager) error {
-	endpoints := map[string]http.HandlerFunc{
-		"/debug/pprof/":        pprof.Index,
-		"/debug/pprof/cmdline": pprof.Cmdline,
-		"/debug/pprof/profile": pprof.Profile,
-		"/debug/pprof/symbol":  pprof.Symbol,
-		"/debug/pprof/trace":   pprof.Trace,
-	}
-
-	for path, handler := range endpoints {
-		err := m.AddMetricsExtraHandler(path, handler)
-		if err != nil {
-			return err
-		}
-	}
-
-	return nil
 }

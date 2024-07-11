@@ -3,10 +3,10 @@ package config
 import (
 	"bytes"
 	"embed"
-	"io/ioutil"
+	"io"
 	"text/template"
 
-	"github.com/ViaQ/logerr/kverrors"
+	"github.com/ViaQ/logerr/v2/kverrors"
 )
 
 const (
@@ -27,7 +27,7 @@ var (
 
 	lokiConfigYAMLTmpl = template.Must(template.ParseFS(lokiConfigYAMLTmplFile, "loki-config.yaml"))
 
-	lokiRuntimeConfigYAMLTmpl = template.Must(template.ParseFS(lokiRuntimeConfigYAMLTmplFile, "loki-runtime-config.yaml"))
+	lokiRuntimeConfigYAMLTmpl = template.Must(template.New("loki-runtime-config.yaml").ParseFS(lokiRuntimeConfigYAMLTmplFile, "loki-runtime-config.yaml"))
 )
 
 // Build builds a loki stack configuration files
@@ -38,7 +38,7 @@ func Build(opts Options) ([]byte, []byte, error) {
 	if err != nil {
 		return nil, nil, kverrors.Wrap(err, "failed to create loki configuration")
 	}
-	cfg, err := ioutil.ReadAll(w)
+	cfg, err := io.ReadAll(w)
 	if err != nil {
 		return nil, nil, kverrors.Wrap(err, "failed to read configuration from buffer")
 	}
@@ -48,7 +48,7 @@ func Build(opts Options) ([]byte, []byte, error) {
 	if err != nil {
 		return nil, nil, kverrors.Wrap(err, "failed to create loki runtime configuration")
 	}
-	rcfg, err := ioutil.ReadAll(w)
+	rcfg, err := io.ReadAll(w)
 	if err != nil {
 		return nil, nil, kverrors.Wrap(err, "failed to read configuration from buffer")
 	}

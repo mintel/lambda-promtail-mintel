@@ -1,25 +1,29 @@
-//go:build linux && cgo
-// +build linux,cgo
+//go:build linux && cgo && promtail_journal_enabled
+// +build linux,cgo,promtail_journal_enabled
 
 package journal
 
 import (
 	"io"
 	"os"
+	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
 	"github.com/coreos/go-systemd/sdjournal"
 	"github.com/go-kit/log"
+	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/client_golang/prometheus/testutil"
 	"github.com/prometheus/prometheus/model/relabel"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 	"gopkg.in/yaml.v2"
 
-	"github.com/grafana/loki/clients/pkg/promtail/client/fake"
-	"github.com/grafana/loki/clients/pkg/promtail/positions"
-	"github.com/grafana/loki/clients/pkg/promtail/scrapeconfig"
-	"github.com/grafana/loki/clients/pkg/promtail/targets/testutils"
+	"github.com/grafana/loki/v3/clients/pkg/promtail/client/fake"
+	"github.com/grafana/loki/v3/clients/pkg/promtail/positions"
+	"github.com/grafana/loki/v3/clients/pkg/promtail/scrapeconfig"
+	"github.com/grafana/loki/v3/clients/pkg/promtail/targets/testutils"
 )
 
 type mockJournalReader struct {
@@ -35,7 +39,7 @@ func (r *mockJournalReader) Close() error {
 	return nil
 }
 
-func (r *mockJournalReader) Follow(until <-chan time.Time, writer io.Writer) error {
+func (r *mockJournalReader) Follow(until <-chan time.Time, _ io.Writer) error {
 	<-until
 	return nil
 }
@@ -46,12 +50,11 @@ func newMockJournalEntry(entry *sdjournal.JournalEntry) journalEntryFunc {
 	}
 }
 
-func (r *mockJournalReader) Write(msg string, fields map[string]string) {
+func (r *mockJournalReader) Write(fields map[string]string) {
 	allFields := make(map[string]string, len(fields))
 	for k, v := range fields {
 		allFields[k] = v
 	}
-	allFields["MESSAGE"] = msg
 
 	ts := uint64(time.Now().UnixNano())
 
@@ -68,7 +71,7 @@ func TestJournalTarget(t *testing.T) {
 	logger := log.NewLogfmtLogger(w)
 
 	testutils.InitRandom()
-	dirName := "/tmp/" + testutils.RandName()
+	dirName := filepath.Join(os.TempDir(), testutils.RandName())
 	positionsFileName := dirName + "/positions.yml"
 
 	// Set the sync period to a really long value, to guarantee the sync timer
@@ -95,7 +98,8 @@ func TestJournalTarget(t *testing.T) {
 	err = yaml.Unmarshal([]byte(relabelCfg), &relabels)
 	require.NoError(t, err)
 
-	jt, err := journalTargetWithReader(logger, client, ps, "test", relabels,
+	registry := prometheus.NewRegistry()
+	jt, err := journalTargetWithReader(NewMetrics(registry), logger, client, ps, "test", relabels,
 		&scrapeconfig.JournalTargetConfig{}, newMockJournalReader, newMockJournalEntry(nil))
 	require.NoError(t, err)
 
@@ -103,14 +107,93 @@ func TestJournalTarget(t *testing.T) {
 	r.t = t
 
 	for i := 0; i < 10; i++ {
-		r.Write("ping", map[string]string{
+		r.Write(map[string]string{
+			"MESSAGE":   "ping",
 			"CODE_FILE": "journaltarget_test.go",
 		})
 		assert.NoError(t, err)
 	}
 	require.NoError(t, jt.Stop())
 	client.Stop()
+
+	expectedMetrics := `# HELP promtail_journal_target_lines_total Total number of successful journal lines read
+	# TYPE promtail_journal_target_lines_total counter
+	promtail_journal_target_lines_total 10
+	`
+
+	if err := testutil.GatherAndCompare(registry,
+		strings.NewReader(expectedMetrics)); err != nil {
+		t.Fatalf("mismatch metrics: %v", err)
+	}
 	assert.Len(t, client.Received(), 10)
+}
+
+func TestJournalTargetParsingErrors(t *testing.T) {
+	w := log.NewSyncWriter(os.Stderr)
+	logger := log.NewLogfmtLogger(w)
+
+	testutils.InitRandom()
+	dirName := filepath.Join(os.TempDir(), testutils.RandName())
+	positionsFileName := dirName + "/positions.yml"
+
+	// Set the sync period to a really long value, to guarantee the sync timer
+	// never runs, this way we know everything saved was done through channel
+	// notifications when target.stop() was called.
+	ps, err := positions.New(logger, positions.Config{
+		SyncPeriod:    10 * time.Second,
+		PositionsFile: positionsFileName,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	client := fake.New(func() {})
+
+	// We specify no relabel rules, so that we end up with an empty labelset
+	var relabels []*relabel.Config
+
+	registry := prometheus.NewRegistry()
+	jt, err := journalTargetWithReader(NewMetrics(registry), logger, client, ps, "test", relabels,
+		&scrapeconfig.JournalTargetConfig{}, newMockJournalReader, newMockJournalEntry(nil))
+	require.NoError(t, err)
+
+	r := jt.r.(*mockJournalReader)
+	r.t = t
+
+	// No labels but correct message
+	for i := 0; i < 10; i++ {
+		r.Write(map[string]string{
+			"MESSAGE":   "ping",
+			"CODE_FILE": "journaltarget_test.go",
+		})
+		assert.NoError(t, err)
+	}
+
+	// No labels and no message
+	for i := 0; i < 10; i++ {
+		r.Write(map[string]string{
+			"CODE_FILE": "journaltarget_test.go",
+		})
+		assert.NoError(t, err)
+	}
+	require.NoError(t, jt.Stop())
+	client.Stop()
+
+	expectedMetrics := `# HELP promtail_journal_target_lines_total Total number of successful journal lines read
+	# TYPE promtail_journal_target_lines_total counter
+	promtail_journal_target_lines_total 0
+	# HELP promtail_journal_target_parsing_errors_total Total number of parsing errors while reading journal messages
+	# TYPE promtail_journal_target_parsing_errors_total counter
+	promtail_journal_target_parsing_errors_total{error="empty_labels"} 10
+	promtail_journal_target_parsing_errors_total{error="no_message"} 10
+	`
+
+	if err := testutil.GatherAndCompare(registry,
+		strings.NewReader(expectedMetrics)); err != nil {
+		t.Fatalf("mismatch metrics: %v", err)
+	}
+
+	assert.Len(t, client.Received(), 0)
 }
 
 func TestJournalTarget_JSON(t *testing.T) {
@@ -118,7 +201,7 @@ func TestJournalTarget_JSON(t *testing.T) {
 	logger := log.NewLogfmtLogger(w)
 
 	testutils.InitRandom()
-	dirName := "/tmp/" + testutils.RandName()
+	dirName := filepath.Join(os.TempDir(), testutils.RandName())
 	positionsFileName := dirName + "/positions.yml"
 
 	// Set the sync period to a really long value, to guarantee the sync timer
@@ -147,7 +230,7 @@ func TestJournalTarget_JSON(t *testing.T) {
 
 	cfg := &scrapeconfig.JournalTargetConfig{JSON: true}
 
-	jt, err := journalTargetWithReader(logger, client, ps, "test", relabels,
+	jt, err := journalTargetWithReader(NewMetrics(prometheus.NewRegistry()), logger, client, ps, "test", relabels,
 		cfg, newMockJournalReader, newMockJournalEntry(nil))
 	require.NoError(t, err)
 
@@ -155,7 +238,8 @@ func TestJournalTarget_JSON(t *testing.T) {
 	r.t = t
 
 	for i := 0; i < 10; i++ {
-		r.Write("ping", map[string]string{
+		r.Write(map[string]string{
+			"MESSAGE":     "ping",
 			"CODE_FILE":   "journaltarget_test.go",
 			"OTHER_FIELD": "foobar",
 		})
@@ -177,7 +261,7 @@ func TestJournalTarget_Since(t *testing.T) {
 	logger := log.NewLogfmtLogger(w)
 
 	testutils.InitRandom()
-	dirName := "/tmp/" + testutils.RandName()
+	dirName := filepath.Join(os.TempDir(), testutils.RandName())
 	positionsFileName := dirName + "/positions.yml"
 
 	// Set the sync period to a really long value, to guarantee the sync timer
@@ -197,7 +281,7 @@ func TestJournalTarget_Since(t *testing.T) {
 		MaxAge: "4h",
 	}
 
-	jt, err := journalTargetWithReader(logger, client, ps, "test", nil,
+	jt, err := journalTargetWithReader(NewMetrics(prometheus.NewRegistry()), logger, client, ps, "test", nil,
 		&cfg, newMockJournalReader, newMockJournalEntry(nil))
 	require.NoError(t, err)
 
@@ -211,7 +295,7 @@ func TestJournalTarget_Cursor_TooOld(t *testing.T) {
 	logger := log.NewLogfmtLogger(w)
 
 	testutils.InitRandom()
-	dirName := "/tmp/" + testutils.RandName()
+	dirName := filepath.Join(os.TempDir(), testutils.RandName())
 	positionsFileName := dirName + "/positions.yml"
 
 	// Set the sync period to a really long value, to guarantee the sync timer
@@ -237,7 +321,7 @@ func TestJournalTarget_Cursor_TooOld(t *testing.T) {
 		RealtimeTimestamp: uint64(entryTs.UnixNano()),
 	})
 
-	jt, err := journalTargetWithReader(logger, client, ps, "test", nil,
+	jt, err := journalTargetWithReader(NewMetrics(prometheus.NewRegistry()), logger, client, ps, "test", nil,
 		&cfg, newMockJournalReader, journalEntry)
 	require.NoError(t, err)
 
@@ -251,7 +335,7 @@ func TestJournalTarget_Cursor_NotTooOld(t *testing.T) {
 	logger := log.NewLogfmtLogger(w)
 
 	testutils.InitRandom()
-	dirName := "/tmp/" + testutils.RandName()
+	dirName := filepath.Join(os.TempDir(), testutils.RandName())
 	positionsFileName := dirName + "/positions.yml"
 
 	// Set the sync period to a really long value, to guarantee the sync timer
@@ -277,7 +361,7 @@ func TestJournalTarget_Cursor_NotTooOld(t *testing.T) {
 		RealtimeTimestamp: uint64(entryTs.UnixNano() / int64(time.Microsecond)),
 	})
 
-	jt, err := journalTargetWithReader(logger, client, ps, "test", nil,
+	jt, err := journalTargetWithReader(NewMetrics(prometheus.NewRegistry()), logger, client, ps, "test", nil,
 		&cfg, newMockJournalReader, journalEntry)
 	require.NoError(t, err)
 
@@ -301,4 +385,39 @@ func Test_MakeJournalFields(t *testing.T) {
 		"__journal_priority_keyword": "info",
 	}
 	assert.Equal(t, expectedFields, receivedFields)
+}
+
+func TestJournalTarget_Matches(t *testing.T) {
+	w := log.NewSyncWriter(os.Stderr)
+	logger := log.NewLogfmtLogger(w)
+
+	testutils.InitRandom()
+	dirName := filepath.Join(os.TempDir(), testutils.RandName())
+	positionsFileName := dirName + "/positions.yml"
+
+	// Set the sync period to a really long value, to guarantee the sync timer
+	// never runs, this way we know everything saved was done through channel
+	// notifications when target.stop() was called.
+	ps, err := positions.New(logger, positions.Config{
+		SyncPeriod:    10 * time.Second,
+		PositionsFile: positionsFileName,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	client := fake.New(func() {})
+
+	cfg := scrapeconfig.JournalTargetConfig{
+		Matches: "UNIT=foo.service PRIORITY=1",
+	}
+
+	jt, err := journalTargetWithReader(NewMetrics(prometheus.NewRegistry()), logger, client, ps, "test", nil,
+		&cfg, newMockJournalReader, newMockJournalEntry(nil))
+	require.NoError(t, err)
+
+	r := jt.r.(*mockJournalReader)
+	matches := []sdjournal.Match{{Field: "UNIT", Value: "foo.service"}, {Field: "PRIORITY", Value: "1"}}
+	require.Equal(t, r.config.Matches, matches)
+	client.Stop()
 }

@@ -1,7 +1,7 @@
 package unmarshal
 
 import (
-	"io/ioutil"
+	"io"
 	"log"
 	"strings"
 	"testing"
@@ -9,7 +9,7 @@ import (
 
 	"github.com/stretchr/testify/require"
 
-	"github.com/grafana/loki/pkg/logproto"
+	"github.com/grafana/loki/v3/pkg/logproto"
 )
 
 // covers requests to /api/prom/push
@@ -25,6 +25,14 @@ var pushTests = []struct {
 						Timestamp: mustParse(time.RFC3339Nano, "2019-09-13T18:32:22.380001319Z"),
 						Line:      "super line",
 					},
+					{
+						Timestamp: mustParse(time.RFC3339Nano, "2019-09-13T18:32:23.380001319Z"),
+						Line:      "super line with labels",
+						StructuredMetadata: []logproto.LabelAdapter{
+							{Name: "a", Value: "1"},
+							{Name: "b", Value: "2"},
+						},
+					},
 				},
 				Labels: `{test="test"}`,
 			},
@@ -37,6 +45,14 @@ var pushTests = []struct {
 						{
 							"ts": "2019-09-13T18:32:22.380001319Z",
 							"line": "super line"
+						},
+						{
+							"ts": "2019-09-13T18:32:23.380001319Z",
+							"line": "super line with labels",
+							"structuredMetadata": {
+								"a": "1",
+								"b": "2"
+							}
 						}
 					]
 				}
@@ -49,7 +65,7 @@ func Test_DecodePushRequest(t *testing.T) {
 
 	for i, pushTest := range pushTests {
 		var actual logproto.PushRequest
-		closer := ioutil.NopCloser(strings.NewReader(pushTest.actual))
+		closer := io.NopCloser(strings.NewReader(pushTest.actual))
 
 		err := DecodePushRequest(closer, &actual)
 		require.NoError(t, err)

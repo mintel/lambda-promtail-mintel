@@ -14,8 +14,9 @@ import (
 	consul "github.com/hashicorp/consul/api"
 	"github.com/hashicorp/go-cleanhttp"
 	"github.com/prometheus/client_golang/prometheus"
-	"github.com/weaveworks/common/instrument"
 	"golang.org/x/time/rate"
+
+	"github.com/grafana/dskit/instrument"
 
 	"github.com/grafana/dskit/backoff"
 	"github.com/grafana/dskit/flagext"
@@ -46,10 +47,10 @@ type Config struct {
 	ConsistentReads   bool           `yaml:"consistent_reads" category:"advanced"`
 	WatchKeyRateLimit float64        `yaml:"watch_rate_limit" category:"advanced"` // Zero disables rate limit
 	WatchKeyBurstSize int            `yaml:"watch_burst_size" category:"advanced"` // Burst when doing rate-limit, defaults to 1
+	CasRetryDelay     time.Duration  `yaml:"cas_retry_delay" category:"advanced"`
 
 	// Used in tests only.
-	MaxCasRetries int           `yaml:"-"`
-	CasRetryDelay time.Duration `yaml:"-"`
+	MaxCasRetries int `yaml:"-"`
 }
 
 type kv interface {
@@ -78,6 +79,7 @@ func (cfg *Config) RegisterFlags(f *flag.FlagSet, prefix string) {
 	f.BoolVar(&cfg.ConsistentReads, prefix+"consul.consistent-reads", false, "Enable consistent reads to Consul.")
 	f.Float64Var(&cfg.WatchKeyRateLimit, prefix+"consul.watch-rate-limit", 1, "Rate limit when watching key or prefix in Consul, in requests per second. 0 disables the rate limit.")
 	f.IntVar(&cfg.WatchKeyBurstSize, prefix+"consul.watch-burst-size", 1, "Burst size used in rate limit. Values less than 1 are treated as 1.")
+	f.DurationVar(&cfg.CasRetryDelay, prefix+"consul.cas-retry-delay", 1*time.Second, "Maximum duration to wait before retrying a Compare And Swap (CAS) operation.")
 }
 
 // NewClient returns a new Client.
@@ -251,7 +253,7 @@ func (c *Client) WatchKey(ctx context.Context, key string, f func(interface{}) b
 		}
 
 		if kvp == nil {
-			level.Info(c.logger).Log("msg", "value is nil", "key", key, "index", index)
+			level.Debug(c.logger).Log("msg", "value is nil", "key", key, "index", index)
 			continue
 		}
 
@@ -400,7 +402,7 @@ func (c *Client) createRateLimiter() *rate.Limiter {
 
 // WithCodec Clones and changes the codec of the consul client.
 func (c *Client) WithCodec(codec codec.Codec) *Client {
-	new := *c
-	new.codec = codec
-	return &new
+	n := *c
+	n.codec = codec
+	return &n
 }

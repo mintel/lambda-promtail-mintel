@@ -17,7 +17,8 @@
               severity: 'critical',
             },
             annotations: {
-              message: |||
+              summary: 'Promtail request error rate is high.',
+              description: |||
                 {{ $labels.job }} {{ $labels.route }} is experiencing {{ printf "%.2f" $value }}% errors.
               |||,
             },
@@ -32,23 +33,9 @@
               severity: 'critical',
             },
             annotations: {
-              message: |||
+              summary: 'Promtail request latency P99 is high.',
+              description: |||
                 {{ $labels.job }} {{ $labels.route }} is experiencing {{ printf "%.2f" $value }}s 99th percentile latency.
-              |||,
-            },
-          },
-          {
-            alert: 'PromtailFileLagging',
-            expr: |||
-              promtail_stream_lag_seconds > 10
-            |||,
-            'for': '15m',
-            labels: {
-              severity: 'warning',
-            },
-            annotations: {
-              message: |||
-                {{ $labels.instance }} {{ $labels.job }} {{ $labels.path }} has been lagging by more than 10 seconds for more than 15m.
               |||,
             },
           },
@@ -59,10 +46,11 @@
             |||,
             'for': '15m',
             labels: {
-              severity: 'critical',
+              severity: 'warning',
             },
             annotations: {
-              message: |||
+              summary: 'Promtail cannot find a file it should be tailing.',
+              description: |||
                 {{ $labels.instance }} {{ $labels.job }} {{ $labels.path }} matches the glob but is not being tailed.
               |||,
             },

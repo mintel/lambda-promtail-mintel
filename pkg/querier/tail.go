@@ -6,13 +6,16 @@ import (
 	"sync"
 	"time"
 
+	"go.uber.org/atomic"
+
+	"github.com/go-kit/log"
 	"github.com/go-kit/log/level"
 	"github.com/pkg/errors"
 
-	"github.com/grafana/loki/pkg/iter"
-	loghttp "github.com/grafana/loki/pkg/loghttp/legacy"
-	"github.com/grafana/loki/pkg/logproto"
-	util_log "github.com/grafana/loki/pkg/util/log"
+	"github.com/grafana/loki/v3/pkg/iter"
+	loghttp "github.com/grafana/loki/v3/pkg/loghttp/legacy"
+	"github.com/grafana/loki/v3/pkg/logproto"
+	util_log "github.com/grafana/loki/v3/pkg/util/log"
 )
 
 const (
@@ -41,20 +44,27 @@ type Tailer struct {
 	currEntry  logproto.Entry
 	currLabels string
 
+	// keep track of the streams for metrics about active streams
+	seenStreams    map[uint64]struct{}
+	seenStreamsMtx sync.Mutex
+
 	tailDisconnectedIngesters func([]string) (map[string]logproto.Querier_TailClient, error)
 
 	querierTailClients    map[string]logproto.Querier_TailClient // addr -> grpc clients for tailing logs from ingesters
 	querierTailClientsMtx sync.RWMutex
 
-	stopped         bool
-	delayFor        time.Duration
-	responseChan    chan *loghttp.TailResponse
-	closeErrChan    chan error
-	tailMaxDuration time.Duration
+	stopped          atomic.Bool
+	delayFor         time.Duration
+	responseChan     chan *loghttp.TailResponse
+	closeErrChan     chan error
+	tailMaxDuration  time.Duration
+	categorizeLabels bool
 
 	// if we are not seeing any response from ingester,
 	// how long do we want to wait by going into sleep
 	waitEntryThrottle time.Duration
+	metrics           *Metrics
+	logger            log.Logger
 }
 
 func (t *Tailer) readTailClients() {
@@ -77,16 +87,17 @@ func (t *Tailer) loop() {
 
 	droppedEntries := make([]loghttp.DroppedEntry, 0)
 
-	for !t.stopped {
+	stopped := t.stopped.Load()
+	for !stopped {
 		select {
 		case <-checkConnectionTicker.C:
 			// Try to reconnect dropped ingesters and connect to new ingesters
 			if err := t.checkIngesterConnections(); err != nil {
-				level.Error(util_log.Logger).Log("msg", "Error reconnecting to disconnected ingesters", "err", err)
+				level.Error(t.logger).Log("msg", "Error reconnecting to disconnected ingesters", "err", err)
 			}
 		case <-tailMaxDurationTicker.C:
 			if err := t.close(); err != nil {
-				level.Error(util_log.Logger).Log("msg", "Error closing Tailer", "err", err)
+				level.Error(t.logger).Log("msg", "Error closing Tailer", "err", err)
 			}
 			t.closeErrChan <- errors.New("reached tail max duration limit")
 			return
@@ -95,8 +106,11 @@ func (t *Tailer) loop() {
 
 		// Read as much entries as we can (up to the max allowed) and populate the
 		// tail response we'll send over the response channel
-		tailResponse := new(loghttp.TailResponse)
-		entriesCount := 0
+		var (
+			tailResponse = new(loghttp.TailResponse)
+			entriesCount = 0
+			entriesSize  = 0
+		)
 
 		for ; entriesCount < maxEntriesPerTailResponse && t.next(); entriesCount++ {
 			// If the response channel channel is blocked, we drop the current entry directly
@@ -106,6 +120,7 @@ func (t *Tailer) loop() {
 				continue
 			}
 
+			entriesSize += len(t.currEntry.Line)
 			tailResponse.Streams = append(tailResponse.Streams, logproto.Stream{
 				Labels:  t.currLabels,
 				Entries: []logproto.Entry{t.currEntry},
@@ -128,12 +143,12 @@ func (t *Tailer) loop() {
 			if numClients == 0 {
 				// All the connections to ingesters are dropped, try reconnecting or return error
 				if err := t.checkIngesterConnections(); err != nil {
-					level.Error(util_log.Logger).Log("msg", "Error reconnecting to ingesters", "err", err)
+					level.Error(t.logger).Log("msg", "Error reconnecting to ingesters", "err", err)
 				} else {
 					continue
 				}
 				if err := t.close(); err != nil {
-					level.Error(util_log.Logger).Log("msg", "Error closing Tailer", "err", err)
+					level.Error(t.logger).Log("msg", "Error closing Tailer", "err", err)
 				}
 				t.closeErrChan <- errors.New("all ingesters closed the connection")
 				return
@@ -151,6 +166,7 @@ func (t *Tailer) loop() {
 
 		select {
 		case t.responseChan <- tailResponse:
+			t.metrics.tailedBytesTotal.Add(float64(entriesSize))
 			if len(droppedEntries) > 0 {
 				droppedEntries = make([]loghttp.DroppedEntry, 0)
 			}
@@ -199,9 +215,10 @@ func (t *Tailer) readTailClient(addr string, querierTailClient logproto.Querier_
 	var err error
 	defer t.dropTailClient(addr)
 
-	logger := util_log.WithContext(querierTailClient.Context(), util_log.Logger)
+	logger := util_log.WithContext(querierTailClient.Context(), t.logger)
 	for {
-		if t.stopped {
+		stopped := t.stopped.Load()
+		if stopped {
 			if err := querierTailClient.CloseSend(); err != nil {
 				level.Error(logger).Log("msg", "Error closing grpc tail client", "err", err)
 			}
@@ -210,7 +227,7 @@ func (t *Tailer) readTailClient(addr string, querierTailClient logproto.Querier_
 		resp, err = querierTailClient.Recv()
 		if err != nil {
 			// We don't want to log error when its due to stopping the tail request
-			if !t.stopped {
+			if !stopped {
 				level.Error(logger).Log("msg", "Error receiving response from grpc tail client", "err", err)
 			}
 			break
@@ -224,7 +241,12 @@ func (t *Tailer) pushTailResponseFromIngester(resp *logproto.TailResponse) {
 	t.streamMtx.Lock()
 	defer t.streamMtx.Unlock()
 
-	t.openStreamIterator.Push(iter.NewStreamIterator(*resp.Stream))
+	itr := iter.NewStreamIterator(*resp.Stream)
+	if t.categorizeLabels {
+		itr = iter.NewCategorizeLabelsIterator(itr)
+	}
+
+	t.openStreamIterator.Push(itr)
 }
 
 // finds oldest entry by peeking at open stream iterator.
@@ -233,12 +255,14 @@ func (t *Tailer) next() bool {
 	t.streamMtx.Lock()
 	defer t.streamMtx.Unlock()
 
-	if t.openStreamIterator.Len() == 0 || !time.Now().After(t.openStreamIterator.Peek().Add(t.delayFor)) || !t.openStreamIterator.Next() {
+	if t.openStreamIterator.IsEmpty() || !time.Now().After(t.openStreamIterator.Peek().Add(t.delayFor)) || !t.openStreamIterator.Next() {
 		return false
 	}
 
 	t.currEntry = t.openStreamIterator.Entry()
 	t.currLabels = t.openStreamIterator.Labels()
+	t.recordStream(t.openStreamIterator.StreamHash())
+
 	return true
 }
 
@@ -246,7 +270,11 @@ func (t *Tailer) close() error {
 	t.streamMtx.Lock()
 	defer t.streamMtx.Unlock()
 
-	t.stopped = true
+	t.metrics.tailsActive.Dec()
+	t.metrics.tailedStreamsActive.Sub(t.activeStreamCount())
+
+	t.stopped.Store(true)
+
 	return t.openStreamIterator.Close()
 }
 
@@ -264,6 +292,25 @@ func (t *Tailer) getCloseErrorChan() <-chan error {
 	return t.closeErrChan
 }
 
+func (t *Tailer) recordStream(id uint64) {
+	t.seenStreamsMtx.Lock()
+	defer t.seenStreamsMtx.Unlock()
+
+	if _, ok := t.seenStreams[id]; ok {
+		return
+	}
+
+	t.seenStreams[id] = struct{}{}
+	t.metrics.tailedStreamsActive.Inc()
+}
+
+func (t *Tailer) activeStreamCount() float64 {
+	t.seenStreamsMtx.Lock()
+	defer t.seenStreamsMtx.Unlock()
+
+	return float64(len(t.seenStreams))
+}
+
 func newTailer(
 	delayFor time.Duration,
 	querierTailClients map[string]logproto.Querier_TailClient,
@@ -271,18 +318,31 @@ func newTailer(
 	tailDisconnectedIngesters func([]string) (map[string]logproto.Querier_TailClient, error),
 	tailMaxDuration time.Duration,
 	waitEntryThrottle time.Duration,
+	categorizeLabels bool,
+	m *Metrics,
+	logger log.Logger,
 ) *Tailer {
+	historicEntriesIter := historicEntries
+	if categorizeLabels {
+		historicEntriesIter = iter.NewCategorizeLabelsIterator(historicEntries)
+	}
+
 	t := Tailer{
-		openStreamIterator:        iter.NewMergeEntryIterator(context.Background(), []iter.EntryIterator{historicEntries}, logproto.FORWARD),
+		openStreamIterator:        iter.NewMergeEntryIterator(context.Background(), []iter.EntryIterator{historicEntriesIter}, logproto.FORWARD),
 		querierTailClients:        querierTailClients,
 		delayFor:                  delayFor,
 		responseChan:              make(chan *loghttp.TailResponse, maxBufferedTailResponses),
 		closeErrChan:              make(chan error),
+		seenStreams:               make(map[uint64]struct{}),
 		tailDisconnectedIngesters: tailDisconnectedIngesters,
 		tailMaxDuration:           tailMaxDuration,
 		waitEntryThrottle:         waitEntryThrottle,
+		categorizeLabels:          categorizeLabels,
+		metrics:                   m,
+		logger:                    logger,
 	}
 
+	t.metrics.tailsActive.Inc()
 	t.readTailClients()
 	go t.loop()
 	return &t

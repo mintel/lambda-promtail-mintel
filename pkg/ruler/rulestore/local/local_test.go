@@ -2,7 +2,6 @@ package local
 
 import (
 	"context"
-	"io/ioutil"
 	"os"
 	"path"
 	"testing"
@@ -14,7 +13,7 @@ import (
 	"github.com/stretchr/testify/require"
 	"gopkg.in/yaml.v3"
 
-	"github.com/grafana/loki/pkg/ruler/rulespb"
+	"github.com/grafana/loki/v3/pkg/ruler/rulespb"
 )
 
 func TestClient_LoadAllRuleGroups(t *testing.T) {
@@ -51,7 +50,7 @@ func TestClient_LoadAllRuleGroups(t *testing.T) {
 	err = os.Symlink(user1, path.Join(dir, user2))
 	require.NoError(t, err)
 
-	err = ioutil.WriteFile(path.Join(dir, user1, namespace1), b, 0777)
+	err = os.WriteFile(path.Join(dir, user1, namespace1), b, 0777)
 	require.NoError(t, err)
 
 	const ignoredDir = "ignored-dir"

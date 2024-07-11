@@ -9,21 +9,21 @@ import (
 
 	"github.com/go-kit/log"
 	"github.com/go-kit/log/level"
+	"github.com/grafana/dskit/httpgrpc"
 	"github.com/grafana/dskit/services"
 	"github.com/opentracing/opentracing-go"
 	"github.com/pkg/errors"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promauto"
-	"github.com/weaveworks/common/httpgrpc"
 
 	"github.com/grafana/dskit/tenant"
 
-	"github.com/grafana/loki/pkg/lokifrontend/frontend/v1/frontendv1pb"
-	"github.com/grafana/loki/pkg/querier/stats"
-	"github.com/grafana/loki/pkg/scheduler/queue"
-	"github.com/grafana/loki/pkg/util"
-	lokigrpc "github.com/grafana/loki/pkg/util/httpgrpc"
-	"github.com/grafana/loki/pkg/util/validation"
+	"github.com/grafana/loki/v3/pkg/lokifrontend/frontend/v1/frontendv1pb"
+	"github.com/grafana/loki/v3/pkg/querier/stats"
+	"github.com/grafana/loki/v3/pkg/queue"
+	"github.com/grafana/loki/v3/pkg/scheduler/limits"
+	"github.com/grafana/loki/v3/pkg/util"
+	lokigrpc "github.com/grafana/loki/v3/pkg/util/httpgrpc"
 )
 
 var errTooManyRequest = httpgrpc.Errorf(http.StatusTooManyRequests, "too many outstanding requests")
@@ -37,12 +37,15 @@ type Config struct {
 // RegisterFlags adds the flags required to config this to the given FlagSet.
 func (cfg *Config) RegisterFlags(f *flag.FlagSet) {
 	f.IntVar(&cfg.MaxOutstandingPerTenant, "querier.max-outstanding-requests-per-tenant", 2048, "Maximum number of outstanding requests per tenant per frontend; requests beyond this error with HTTP 429.")
-	f.DurationVar(&cfg.QuerierForgetDelay, "query-frontend.querier-forget-delay", 0, "If a querier disconnects without sending notification about graceful shutdown, the query-frontend will keep the querier in the tenant's shard until the forget delay has passed. This feature is useful to reduce the blast radius when shuffle-sharding is enabled.")
+	f.DurationVar(&cfg.QuerierForgetDelay, "query-frontend.querier-forget-delay", 0, "In the event a tenant is repeatedly sending queries that lead the querier to crash or be killed due to an out-of-memory error, the crashed querier will be disconnected from the query frontend and a new querier will be immediately assigned to the tenant’s shard. This invalidates the assumption that shuffle sharding can be used to reduce the impact on tenants. This option mitigates the impact by configuring a delay between when a querier disconnects because of a crash and when the crashed querier is actually removed from the tenant's shard.")
 }
 
 type Limits interface {
 	// Returns max queriers to use per tenant, or 0 if shuffle sharding is disabled.
-	MaxQueriersPerUser(user string) int
+	MaxQueriersPerUser(user string) uint
+
+	// MaxQueryCapacity returns how much of the available query capacity can be used by this user.
+	MaxQueryCapacity(user string) float64
 }
 
 // Frontend queues HTTP requests, dispatches them to backends, and handles retries
@@ -61,11 +64,12 @@ type Frontend struct {
 	subservices        *services.Manager
 	subservicesWatcher *services.FailureWatcher
 
-	// Metrics.
-	queueLength       *prometheus.GaugeVec
-	discardedRequests *prometheus.CounterVec
-	numClients        prometheus.GaugeFunc
-	queueDuration     prometheus.Histogram
+	// qeueue metrics
+	queueMetrics *queue.Metrics
+
+	// frontend metrics
+	numClients    prometheus.GaugeFunc
+	queueDuration prometheus.Histogram
 }
 
 type request struct {
@@ -79,27 +83,22 @@ type request struct {
 }
 
 // New creates a new frontend. Frontend implements service, and must be started and stopped.
-func New(cfg Config, limits Limits, log log.Logger, registerer prometheus.Registerer) (*Frontend, error) {
+func New(cfg Config, frontendLimits Limits, log log.Logger, registerer prometheus.Registerer, metricsNamespace string) (*Frontend, error) {
+	queueMetrics := queue.NewMetrics(registerer, metricsNamespace, "query_frontend")
 	f := &Frontend{
-		cfg:    cfg,
-		log:    log,
-		limits: limits,
-		queueLength: promauto.With(registerer).NewGaugeVec(prometheus.GaugeOpts{
-			Name: "cortex_query_frontend_queue_length",
-			Help: "Number of queries in the queue.",
-		}, []string{"user"}),
-		discardedRequests: promauto.With(registerer).NewCounterVec(prometheus.CounterOpts{
-			Name: "cortex_query_frontend_discarded_requests_total",
-			Help: "Total number of query requests discarded.",
-		}, []string{"user"}),
+		cfg:          cfg,
+		log:          log,
+		limits:       frontendLimits,
+		queueMetrics: queueMetrics,
 		queueDuration: promauto.With(registerer).NewHistogram(prometheus.HistogramOpts{
-			Name:    "cortex_query_frontend_queue_duration_seconds",
-			Help:    "Time spend by requests queued.",
-			Buckets: prometheus.DefBuckets,
+			Namespace: metricsNamespace,
+			Name:      "query_frontend_queue_duration_seconds",
+			Help:      "Time spend by requests queued.",
+			Buckets:   prometheus.DefBuckets,
 		}),
 	}
 
-	f.requestQueue = queue.NewRequestQueue(cfg.MaxOutstandingPerTenant, cfg.QuerierForgetDelay, f.queueLength, f.discardedRequests)
+	f.requestQueue = queue.NewRequestQueue(cfg.MaxOutstandingPerTenant, cfg.QuerierForgetDelay, limits.NewQueueLimits(frontendLimits), queueMetrics)
 	f.activeUsers = util.NewActiveUsersCleanupWithDefaultValues(f.cleanupInactiveUserMetrics)
 
 	var err error
@@ -109,15 +108,17 @@ func New(cfg Config, limits Limits, log log.Logger, registerer prometheus.Regist
 	}
 
 	f.numClients = promauto.With(registerer).NewGaugeFunc(prometheus.GaugeOpts{
-		Name: "cortex_query_frontend_connected_clients",
-		Help: "Number of worker clients currently connected to the frontend.",
-	}, f.requestQueue.GetConnectedQuerierWorkersMetric)
+		Namespace: metricsNamespace,
+		Name:      "query_frontend_connected_clients",
+		Help:      "Number of worker clients currently connected to the frontend.",
+	}, f.requestQueue.GetConnectedConsumersMetric)
 
 	f.Service = services.NewBasicService(f.starting, f.running, f.stopping)
 	return f, nil
 }
 
 func (f *Frontend) starting(ctx context.Context) error {
+	f.subservicesWatcher = services.NewFailureWatcher()
 	f.subservicesWatcher.WatchManager(f.subservices)
 
 	if err := services.StartManagerAndAwaitHealthy(ctx, f.subservices); err != nil {
@@ -144,8 +145,7 @@ func (f *Frontend) stopping(_ error) error {
 }
 
 func (f *Frontend) cleanupInactiveUserMetrics(user string) {
-	f.queueLength.DeleteLabelValues(user)
-	f.discardedRequests.DeleteLabelValues(user)
+	f.queueMetrics.Cleanup(user)
 }
 
 // RoundTripGRPC round trips a proto (instead of a HTTP request).
@@ -194,17 +194,17 @@ func (f *Frontend) Process(server frontendv1pb.Frontend_ProcessServer) error {
 		return err
 	}
 
-	f.requestQueue.RegisterQuerierConnection(querierID)
-	defer f.requestQueue.UnregisterQuerierConnection(querierID)
+	f.requestQueue.RegisterConsumerConnection(querierID)
+	defer f.requestQueue.UnregisterConsumerConnection(querierID)
 
-	lastUserIndex := queue.FirstUser()
+	lastIndex := queue.StartIndex
 
 	for {
-		reqWrapper, idx, err := f.requestQueue.GetNextRequestForQuerier(server.Context(), lastUserIndex, querierID)
+		reqWrapper, idx, err := f.requestQueue.Dequeue(server.Context(), lastIndex, querierID)
 		if err != nil {
 			return err
 		}
-		lastUserIndex = idx
+		lastIndex = idx
 
 		req := reqWrapper.(*request)
 
@@ -223,7 +223,7 @@ func (f *Frontend) Process(server frontendv1pb.Frontend_ProcessServer) error {
 		  it's possible that it's own queue would perpetually contain only expired requests.
 		*/
 		if req.originalCtx.Err() != nil {
-			lastUserIndex = lastUserIndex.ReuseLastUser()
+			lastIndex = lastIndex.ReuseLastIndex()
 			continue
 		}
 
@@ -278,7 +278,7 @@ func (f *Frontend) Process(server frontendv1pb.Frontend_ProcessServer) error {
 
 func (f *Frontend) NotifyClientShutdown(_ context.Context, req *frontendv1pb.NotifyClientShutdownRequest) (*frontendv1pb.NotifyClientShutdownResponse, error) {
 	level.Info(f.log).Log("msg", "received shutdown notification from querier", "querier", req.GetClientID())
-	f.requestQueue.NotifyQuerierShutdown(req.GetClientID())
+	f.requestQueue.NotifyConsumerShutdown(req.GetClientID())
 
 	return &frontendv1pb.NotifyClientShutdownResponse{}, nil
 }
@@ -315,13 +315,10 @@ func (f *Frontend) queueRequest(ctx context.Context, req *request) error {
 	req.enqueueTime = now
 	req.queueSpan, _ = opentracing.StartSpanFromContext(ctx, "queued")
 
-	// aggregate the max queriers limit in the case of a multi tenant query
-	maxQueriers := validation.SmallestPositiveNonZeroIntPerTenant(tenantIDs, f.limits.MaxQueriersPerUser)
-
 	joinedTenantID := tenant.JoinTenantIDs(tenantIDs)
 	f.activeUsers.UpdateUserTimestamp(joinedTenantID, now)
 
-	err = f.requestQueue.EnqueueRequest(joinedTenantID, req, maxQueriers, nil)
+	err = f.requestQueue.Enqueue(joinedTenantID, nil, req, nil)
 	if err == queue.ErrTooManyRequests {
 		return errTooManyRequest
 	}
@@ -332,7 +329,7 @@ func (f *Frontend) queueRequest(ctx context.Context, req *request) error {
 // chosen to match the same method in the ingester
 func (f *Frontend) CheckReady(_ context.Context) error {
 	// if we have more than one querier connected we will consider ourselves ready
-	connectedClients := f.requestQueue.GetConnectedQuerierWorkersMetric()
+	connectedClients := f.requestQueue.GetConnectedConsumersMetric()
 	if connectedClients > 0 {
 		return nil
 	}

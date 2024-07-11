@@ -1,0 +1,209 @@
+package v1
+
+import (
+	"fmt"
+
+	"github.com/pkg/errors"
+)
+
+type BlockMetadata struct {
+	Options  BlockOptions
+	Series   SeriesHeader
+	Checksum uint32
+}
+
+type Block struct {
+	metrics *Metrics
+	// covers series pages
+	index BlockIndex
+	// covers bloom pages
+	blooms BloomBlock
+
+	metadata BlockMetadata
+
+	reader BlockReader // should this be decoupled from the struct (accepted as method arg instead)?
+
+	initialized bool
+}
+
+func NewBlock(reader BlockReader, metrics *Metrics) *Block {
+	return &Block{
+		reader:  reader,
+		metrics: metrics,
+	}
+}
+
+func (b *Block) Reader() BlockReader {
+	return b.reader
+}
+
+func (b *Block) LoadHeaders() error {
+	// TODO(owen-d): better control over when to decode
+	if !b.initialized {
+		idx, err := b.reader.Index()
+		if err != nil {
+			return errors.Wrap(err, "getting index reader")
+		}
+
+		indexChecksum, err := b.index.DecodeHeaders(idx)
+		if err != nil {
+			return errors.Wrap(err, "decoding index")
+		}
+
+		b.metadata.Options = b.index.opts
+
+		// TODO(owen-d): better pattern
+		xs := make([]SeriesHeader, 0, len(b.index.pageHeaders))
+		for _, h := range b.index.pageHeaders {
+			xs = append(xs, h.SeriesHeader)
+		}
+		b.metadata.Series = aggregateHeaders(xs)
+
+		blooms, err := b.reader.Blooms()
+		if err != nil {
+			return errors.Wrap(err, "getting blooms reader")
+		}
+		bloomChecksum, err := b.blooms.DecodeHeaders(blooms)
+		if err != nil {
+			return errors.Wrap(err, "decoding blooms")
+		}
+		b.initialized = true
+
+		if !b.metadata.Options.Schema.Compatible(b.blooms.schema) {
+			return fmt.Errorf(
+				"schema mismatch: index (%v) vs blooms (%v)",
+				b.metadata.Options.Schema, b.blooms.schema,
+			)
+		}
+
+		b.metadata.Checksum = combineChecksums(indexChecksum, bloomChecksum)
+	}
+	return nil
+
+}
+
+// XOR checksums as a simple checksum combiner with the benefit that
+// each part can be recomputed by XORing the result against the other
+func combineChecksums(index, blooms uint32) uint32 {
+	return index ^ blooms
+}
+
+func (b *Block) Metadata() (BlockMetadata, error) {
+	if err := b.LoadHeaders(); err != nil {
+		return BlockMetadata{}, err
+	}
+	return b.metadata, nil
+}
+
+func (b *Block) Schema() (Schema, error) {
+	if err := b.LoadHeaders(); err != nil {
+		return Schema{}, err
+	}
+	return b.metadata.Options.Schema, nil
+}
+
+type BlockQuerier struct {
+	*LazySeriesIter
+	blooms *LazyBloomIter
+
+	block *Block // ref to underlying block
+}
+
+// NewBlockQuerier returns a new BlockQuerier for the given block.
+// WARNING: If noCapture is true, the underlying byte slice of the bloom page
+// will be returned to the pool for efficiency. This can only safely be used
+// when the underlying bloom bytes don't escape the decoder, i.e.
+// when loading blooms for querying (bloom-gw) but not for writing (bloom-compactor).
+// When usePool is true, the bloom MUST NOT be captured by the caller. Rather,
+// it should be discarded before another call to Next().
+func NewBlockQuerier(b *Block, usePool bool, maxPageSize int) *BlockQuerier {
+	return &BlockQuerier{
+		block:          b,
+		LazySeriesIter: NewLazySeriesIter(b),
+		blooms:         NewLazyBloomIter(b, usePool, maxPageSize),
+	}
+}
+
+func (bq *BlockQuerier) Metadata() (BlockMetadata, error) {
+	return bq.block.Metadata()
+}
+
+func (bq *BlockQuerier) Schema() (Schema, error) {
+	return bq.block.Schema()
+}
+
+func (bq *BlockQuerier) Reset() error {
+	return bq.LazySeriesIter.Seek(0)
+}
+
+func (bq *BlockQuerier) Err() error {
+	if err := bq.LazySeriesIter.Err(); err != nil {
+		return err
+	}
+
+	return bq.blooms.Err()
+}
+
+type BlockQuerierIter struct {
+	*BlockQuerier
+}
+
+// Iter returns a new BlockQuerierIter, which changes the iteration type to SeriesWithBlooms,
+// automatically loading the blooms for each series rather than requiring the caller to
+// turn the offset to a `Bloom` via `LoadOffset`
+func (bq *BlockQuerier) Iter() *BlockQuerierIter {
+	return &BlockQuerierIter{BlockQuerier: bq}
+}
+
+func (b *BlockQuerierIter) Next() bool {
+	return b.LazySeriesIter.Next()
+}
+
+func (b *BlockQuerierIter) At() *SeriesWithBlooms {
+	s := b.LazySeriesIter.At()
+	res := &SeriesWithBlooms{
+		Series: &s.Series,
+		Blooms: newOffsetsIter(b.blooms, s.Offsets),
+	}
+	return res
+}
+
+type offsetsIter struct {
+	blooms  *LazyBloomIter
+	offsets []BloomOffset
+	cur     int
+}
+
+func newOffsetsIter(blooms *LazyBloomIter, offsets []BloomOffset) *offsetsIter {
+	return &offsetsIter{
+		blooms:  blooms,
+		offsets: offsets,
+	}
+}
+
+func (it *offsetsIter) Next() bool {
+	for it.cur < len(it.offsets) {
+
+		if skip := it.blooms.LoadOffset(it.offsets[it.cur]); skip {
+			it.cur++
+			continue
+		}
+
+		it.cur++
+		return it.blooms.Next()
+
+	}
+	return false
+}
+
+func (it *offsetsIter) At() *Bloom {
+	return it.blooms.At()
+}
+
+func (it *offsetsIter) Err() error {
+	return it.blooms.Err()
+}
+
+func (it *offsetsIter) Remaining() int {
+	return len(it.offsets) - it.cur
+}

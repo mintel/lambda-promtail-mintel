@@ -6,9 +6,10 @@ import (
 	"sort"
 	"time"
 
-	"github.com/grafana/loki/pkg/iter"
-	"github.com/grafana/loki/pkg/logproto"
-	"github.com/grafana/loki/pkg/logql/log"
+	"github.com/grafana/loki/v3/pkg/iter"
+	"github.com/grafana/loki/v3/pkg/logproto"
+	"github.com/grafana/loki/v3/pkg/logql/log"
+	"github.com/grafana/loki/v3/pkg/util/filter"
 )
 
 const (
@@ -96,7 +97,7 @@ func (c *dumbChunk) Iterator(_ context.Context, from, through time.Time, directi
 	}, nil
 }
 
-func (c *dumbChunk) SampleIterator(_ context.Context, from, through time.Time, _ log.StreamSampleExtractor) iter.SampleIterator {
+func (c *dumbChunk) SampleIterator(_ context.Context, _, _ time.Time, _ log.StreamSampleExtractor) iter.SampleIterator {
 	return nil
 }
 
@@ -108,7 +109,7 @@ func (c *dumbChunk) BytesWith(_ []byte) ([]byte, error) {
 	return nil, nil
 }
 
-func (c *dumbChunk) WriteTo(w io.Writer) (int64, error) { return 0, nil }
+func (c *dumbChunk) WriteTo(_ io.Writer) (int64, error) { return 0, nil }
 
 func (c *dumbChunk) Blocks(_ time.Time, _ time.Time) []Block {
 	return nil
@@ -122,7 +123,7 @@ func (c *dumbChunk) Close() error {
 	return nil
 }
 
-func (c *dumbChunk) Rebound(start, end time.Time) (Chunk, error) {
+func (c *dumbChunk) Rebound(_, _ time.Time, _ filter.Func) (Chunk, error) {
 	return nil, nil
 }
 

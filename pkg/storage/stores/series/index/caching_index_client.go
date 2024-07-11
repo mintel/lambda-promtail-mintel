@@ -14,34 +14,34 @@ import (
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promauto"
 
-	"github.com/grafana/loki/pkg/storage/chunk/cache"
-	util_log "github.com/grafana/loki/pkg/util/log"
-	"github.com/grafana/loki/pkg/util/spanlogger"
+	"github.com/grafana/loki/v3/pkg/storage/chunk/cache"
+	"github.com/grafana/loki/v3/pkg/util/constants"
+	util_log "github.com/grafana/loki/v3/pkg/util/log"
 )
 
 var (
 	cacheCorruptErrs = promauto.NewCounter(prometheus.CounterOpts{
-		Namespace: "loki",
+		Namespace: constants.Loki,
 		Name:      "querier_index_cache_corruptions_total",
 		Help:      "The number of cache corruptions for the index cache.",
 	})
 	cacheHits = promauto.NewCounter(prometheus.CounterOpts{
-		Namespace: "loki",
+		Namespace: constants.Loki,
 		Name:      "querier_index_cache_hits_total",
 		Help:      "The number of cache hits for the index cache.",
 	})
 	cacheGets = promauto.NewCounter(prometheus.CounterOpts{
-		Namespace: "loki",
+		Namespace: constants.Loki,
 		Name:      "querier_index_cache_gets_total",
 		Help:      "The number of gets for the index cache.",
 	})
 	cachePuts = promauto.NewCounter(prometheus.CounterOpts{
-		Namespace: "loki",
+		Namespace: constants.Loki,
 		Name:      "querier_index_cache_puts_total",
 		Help:      "The number of puts for the index cache.",
 	})
 	cacheEncodeErrs = promauto.NewCounter(prometheus.CounterOpts{
-		Namespace: "loki",
+		Namespace: constants.Loki,
 		Name:      "querier_index_cache_encode_errors_total",
 		Help:      "The number of errors for the index cache while encoding the body.",
 	})
@@ -297,7 +297,6 @@ func isChunksQuery(q Query) bool {
 }
 
 func (s *cachingIndexClient) cacheStore(ctx context.Context, keys []string, batches []ReadBatch) error {
-	logger := util_log.WithContext(ctx, s.logger)
 	cachePuts.Add(float64(len(keys)))
 
 	// We're doing the hashing to handle unicode and key len properly.
@@ -305,9 +304,6 @@ func (s *cachingIndexClient) cacheStore(ctx context.Context, keys []string, batc
 	hashed := make([]string, 0, len(keys))
 	bufs := make([][]byte, 0, len(batches))
 	for i := range keys {
-		if len(batches[i].Entries) != 0 {
-			level.Debug(logger).Log("msg", "caching index entries", "key", keys[i], "count", len(batches[i].Entries))
-		}
 		hashed = append(hashed, cache.HashKey(keys[i]))
 		out, err := proto.Marshal(&batches[i])
 		if err != nil {
@@ -322,10 +318,6 @@ func (s *cachingIndexClient) cacheStore(ctx context.Context, keys []string, batc
 }
 
 func (s *cachingIndexClient) cacheFetch(ctx context.Context, keys []string) (batches []ReadBatch, missed []string) {
-	spanLogger := spanlogger.FromContext(ctx)
-	logger := util_log.WithContext(ctx, s.logger)
-	level.Debug(spanLogger).Log("requested", len(keys))
-
 	cacheGets.Add(float64(len(keys)))
 
 	// Build a map from hash -> key; NB there can be collisions here; we'll fetch
@@ -354,7 +346,7 @@ func (s *cachingIndexClient) cacheFetch(ctx context.Context, keys []string) (bat
 		var readBatch ReadBatch
 
 		if err := proto.Unmarshal(bufs[j], &readBatch); err != nil {
-			level.Warn(spanLogger).Log("msg", "error unmarshalling index entry from cache", "err", err)
+			level.Warn(util_log.Logger).Log("msg", "error unmarshalling index entry from cache", "err", err)
 			cacheCorruptErrs.Inc()
 			continue
 		}
@@ -362,17 +354,12 @@ func (s *cachingIndexClient) cacheFetch(ctx context.Context, keys []string) (bat
 		// Make sure the hash(key) is not a collision in the cache by looking at the
 		// key in the value.
 		if key != readBatch.Key {
-			level.Debug(spanLogger).Log("msg", "dropping index cache entry due to key collision", "key", key, "readBatch.Key", readBatch.Key, "expiry")
+			level.Debug(util_log.Logger).Log("msg", "dropping index cache entry due to key collision", "key", key, "readBatch.Key", readBatch.Key, "expiry")
 			continue
 		}
 
 		if readBatch.Expiry != 0 && time.Now().After(time.Unix(0, readBatch.Expiry)) {
 			continue
-		}
-
-		if len(readBatch.Entries) != 0 {
-			// not using spanLogger to avoid over-inflating traces since the query count can go much higher
-			level.Debug(logger).Log("msg", "found index cache entries", "key", key, "count", len(readBatch.Entries))
 		}
 
 		cacheHits.Inc()
@@ -392,6 +379,5 @@ func (s *cachingIndexClient) cacheFetch(ctx context.Context, keys []string) (bat
 		missed = append(missed, miss)
 	}
 
-	level.Debug(spanLogger).Log("hits", len(batches), "misses", len(misses))
 	return batches, missed
 }

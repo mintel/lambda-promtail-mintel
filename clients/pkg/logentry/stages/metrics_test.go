@@ -12,10 +12,11 @@ import (
 	"github.com/prometheus/client_golang/prometheus/testutil"
 	"github.com/prometheus/common/model"
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 
-	"github.com/grafana/loki/clients/pkg/logentry/metric"
+	"github.com/grafana/loki/v3/clients/pkg/logentry/metric"
 
-	util_log "github.com/grafana/loki/pkg/util/log"
+	util_log "github.com/grafana/loki/v3/pkg/util/log"
 )
 
 var testMetricYaml = `
@@ -126,6 +127,13 @@ func TestMetricsPipeline(t *testing.T) {
 		strings.NewReader(expectedMetrics)); err != nil {
 		t.Fatalf("mismatch metrics: %v", err)
 	}
+
+	pl.Cleanup()
+
+	if err := testutil.GatherAndCompare(registry,
+		strings.NewReader("")); err != nil {
+		t.Fatalf("mismatch metrics: %v", err)
+	}
 }
 
 func TestNegativeGauge(t *testing.T) {
@@ -231,6 +239,139 @@ func TestMetricsWithDropInPipeline(t *testing.T) {
 	}
 }
 
+var testMetricWithNonPromLabel = `
+pipeline_stages:
+- static_labels:
+    good_label: "1"
+- metrics:
+    loki_count:
+      type: Counter
+      source: app
+      description: "should count all entries"
+      config:
+        match_all: true
+        action: inc
+`
+
+func TestNonPrometheusLabelsShouldBeDropped(t *testing.T) {
+	const counterConfig = `
+pipeline_stages:
+- static_labels:
+    good_label: "1"
+- tenant:
+    value: "2"
+- metrics:
+    loki_count:
+      type: Counter
+      source: app
+      description: "should count all entries"
+      config:
+        match_all: true
+        action: inc
+`
+
+	const expectedCounterMetrics = `# HELP promtail_custom_loki_count should count all entries
+# TYPE promtail_custom_loki_count counter
+promtail_custom_loki_count{good_label="1"} 1
+`
+
+	const gaugeConfig = `
+pipeline_stages:
+- regex:
+    expression: 'vehicle=(?P<vehicle>\d+) longitude=(?P<longitude>[-]?\d+\.\d+) latitude=(?P<latitude>\d+\.\d+)'
+- labels:
+    vehicle:
+- metrics:
+    longitude:
+        type: Gauge
+        description: "longitude GPS vehicle"
+        source: longitude
+        config:
+          match_all: true
+          action: set
+`
+
+	const expectedGaugeMetrics = `# HELP promtail_custom_longitude longitude GPS vehicle
+# TYPE promtail_custom_longitude gauge
+promtail_custom_longitude{vehicle="1"} -10.1234
+`
+
+	const histogramConfig = `
+pipeline_stages:
+- json:
+    expressions:
+      payload: payload
+- metrics:
+    payload_size_bytes:
+      type: Histogram
+      description: payload size in bytes
+      source: payload
+      config:
+        buckets: [10, 20]
+`
+
+	const expectedHistogramMetrics = `# HELP promtail_custom_payload_size_bytes payload size in bytes
+# TYPE promtail_custom_payload_size_bytes histogram
+promtail_custom_payload_size_bytes_bucket{test="app",le="10"} 1
+promtail_custom_payload_size_bytes_bucket{test="app",le="20"} 1
+promtail_custom_payload_size_bytes_bucket{test="app",le="+Inf"} 1
+promtail_custom_payload_size_bytes_sum{test="app"} 10
+promtail_custom_payload_size_bytes_count{test="app"} 1
+`
+	for name, tc := range map[string]struct {
+		promtailConfig  string
+		labels          model.LabelSet
+		line            string
+		expectedCollect string
+	}{
+		"counter metric with non-prometheus incoming label": {
+			promtailConfig: testMetricWithNonPromLabel,
+			labels: model.LabelSet{
+				"__bad_label__": "2",
+			},
+			line:            testMetricLogLine1,
+			expectedCollect: expectedCounterMetrics,
+		},
+		"counter metric with tenant step injected label": {
+			promtailConfig:  counterConfig,
+			line:            testMetricLogLine1,
+			expectedCollect: expectedCounterMetrics,
+		},
+		"gauge metric with non-prometheus incoming label": {
+			promtailConfig: gaugeConfig,
+			labels: model.LabelSet{
+				"__bad_label__": "2",
+			},
+			line:            `#<13>Jan 28 14:25:52 vehicle=1 longitude=-10.1234 latitude=15.1234`,
+			expectedCollect: expectedGaugeMetrics,
+		},
+		"histogram metric with non-prometheus incoming label": {
+			promtailConfig: histogramConfig,
+			labels: model.LabelSet{
+				"test":          "app",
+				"__bad_label__": "2",
+			},
+			line:            testMetricLogLine1,
+			expectedCollect: expectedHistogramMetrics,
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			registry := prometheus.NewRegistry()
+			pl, err := NewPipeline(util_log.Logger, loadConfig(tc.promtailConfig), nil, registry)
+			require.NoError(t, err)
+			in := make(chan Entry)
+			out := pl.Run(in)
+
+			in <- newEntry(nil, tc.labels, tc.line, time.Now())
+			close(in)
+			<-out
+
+			err = testutil.GatherAndCompare(registry, strings.NewReader(tc.expectedCollect))
+			require.NoError(t, err, "gathered metrics are different than expected")
+		})
+	}
+}
+
 var metricTestInvalidIdle = "10f"
 
 func TestValidateMetricsConfig(t *testing.T) {
@@ -301,7 +442,7 @@ func TestDefaultIdleDuration(t *testing.T) {
 	if err != nil {
 		t.Fatalf("failed to create stage with metrics: %v", err)
 	}
-	assert.Equal(t, int64(5*time.Minute.Seconds()), ms.(*stageProcessor).Processor.(*metricStage).cfg["total_keys"].maxIdleSec)
+	assert.Equal(t, int64(5*time.Minute.Seconds()), ms.(*metricStage).cfg["total_keys"].maxIdleSec)
 }
 
 var (
@@ -326,7 +467,7 @@ func TestMetricStage_Process(t *testing.T) {
 		"expression": "(?P<get>\"GET).*HTTP/1.1\" (?P<status>\\d*) (?P<time>\\d*ms)",
 	}
 	timeSource := "time"
-	true := "true"
+	tru := "true"
 	metricsConfig := MetricsConfig{
 		"total_keys": MetricConfig{
 			MetricType:  "Counter",
@@ -367,7 +508,7 @@ func TestMetricStage_Process(t *testing.T) {
 			MetricType:  "Counter",
 			Description: "contains_warn",
 			Config: metric.CounterConfig{
-				Value:  &true,
+				Value:  &tru,
 				Action: metric.CounterInc,
 			},
 		},
@@ -375,7 +516,7 @@ func TestMetricStage_Process(t *testing.T) {
 			MetricType:  "Counter",
 			Description: "contains_false",
 			Config: metric.CounterConfig{
-				Value:  &true,
+				Value:  &tru,
 				Action: metric.CounterAdd,
 			},
 		},

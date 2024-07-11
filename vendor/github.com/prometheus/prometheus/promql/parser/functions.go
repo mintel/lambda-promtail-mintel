@@ -16,11 +16,15 @@ package parser
 // Function represents a function of the expression language and is
 // used by function nodes.
 type Function struct {
-	Name       string
-	ArgTypes   []ValueType
-	Variadic   int
-	ReturnType ValueType
+	Name         string
+	ArgTypes     []ValueType
+	Variadic     int
+	ReturnType   ValueType
+	Experimental bool
 }
+
+// EnableExperimentalFunctions controls whether experimentalFunctions are enabled.
+var EnableExperimentalFunctions bool
 
 // Functions is a list of all functions supported by PromQL, including their types.
 var Functions = map[string]*Function{
@@ -132,6 +136,12 @@ var Functions = map[string]*Function{
 		Variadic:   1,
 		ReturnType: ValueTypeVector,
 	},
+	"day_of_year": {
+		Name:       "day_of_year",
+		ArgTypes:   []ValueType{ValueTypeVector},
+		Variadic:   1,
+		ReturnType: ValueTypeVector,
+	},
 	"deg": {
 		Name:       "deg",
 		ArgTypes:   []ValueType{ValueTypeVector},
@@ -155,6 +165,36 @@ var Functions = map[string]*Function{
 	"floor": {
 		Name:       "floor",
 		ArgTypes:   []ValueType{ValueTypeVector},
+		ReturnType: ValueTypeVector,
+	},
+	"histogram_avg": {
+		Name:       "histogram_avg",
+		ArgTypes:   []ValueType{ValueTypeVector},
+		ReturnType: ValueTypeVector,
+	},
+	"histogram_count": {
+		Name:       "histogram_count",
+		ArgTypes:   []ValueType{ValueTypeVector},
+		ReturnType: ValueTypeVector,
+	},
+	"histogram_sum": {
+		Name:       "histogram_sum",
+		ArgTypes:   []ValueType{ValueTypeVector},
+		ReturnType: ValueTypeVector,
+	},
+	"histogram_stddev": {
+		Name:       "histogram_stddev",
+		ArgTypes:   []ValueType{ValueTypeVector},
+		ReturnType: ValueTypeVector,
+	},
+	"histogram_stdvar": {
+		Name:       "histogram_stdvar",
+		ArgTypes:   []ValueType{ValueTypeVector},
+		ReturnType: ValueTypeVector,
+	},
+	"histogram_fraction": {
+		Name:       "histogram_fraction",
+		ArgTypes:   []ValueType{ValueTypeScalar, ValueTypeScalar, ValueTypeVector},
 		ReturnType: ValueTypeVector,
 	},
 	"histogram_quantile": {
@@ -218,6 +258,12 @@ var Functions = map[string]*Function{
 		Name:       "log2",
 		ArgTypes:   []ValueType{ValueTypeVector},
 		ReturnType: ValueTypeVector,
+	},
+	"mad_over_time": {
+		Name:         "mad_over_time",
+		ArgTypes:     []ValueType{ValueTypeMatrix},
+		ReturnType:   ValueTypeVector,
+		Experimental: true,
 	},
 	"max_over_time": {
 		Name:       "max_over_time",
@@ -312,6 +358,20 @@ var Functions = map[string]*Function{
 		ArgTypes:   []ValueType{ValueTypeVector},
 		ReturnType: ValueTypeVector,
 	},
+	"sort_by_label": {
+		Name:         "sort_by_label",
+		ArgTypes:     []ValueType{ValueTypeVector, ValueTypeString},
+		Variadic:     -1,
+		ReturnType:   ValueTypeVector,
+		Experimental: true,
+	},
+	"sort_by_label_desc": {
+		Name:         "sort_by_label_desc",
+		ArgTypes:     []ValueType{ValueTypeVector, ValueTypeString},
+		Variadic:     -1,
+		ReturnType:   ValueTypeVector,
+		Experimental: true,
+	},
 	"sqrt": {
 		Name:       "sqrt",
 		ArgTypes:   []ValueType{ValueTypeVector},
@@ -366,7 +426,7 @@ var Functions = map[string]*Function{
 }
 
 // getFunction returns a predefined Function object for the given name.
-func getFunction(name string) (*Function, bool) {
-	function, ok := Functions[name]
+func getFunction(name string, functions map[string]*Function) (*Function, bool) {
+	function, ok := functions[name]
 	return function, ok
 }

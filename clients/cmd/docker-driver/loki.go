@@ -10,11 +10,11 @@ import (
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/common/model"
 
-	"github.com/grafana/loki/clients/pkg/logentry/stages"
-	"github.com/grafana/loki/clients/pkg/promtail/api"
-	"github.com/grafana/loki/clients/pkg/promtail/client"
+	"github.com/grafana/loki/v3/clients/pkg/logentry/stages"
+	"github.com/grafana/loki/v3/clients/pkg/promtail/api"
+	"github.com/grafana/loki/v3/clients/pkg/promtail/client"
 
-	"github.com/grafana/loki/pkg/logproto"
+	"github.com/grafana/loki/v3/pkg/logproto"
 )
 
 var jobName = "docker"
@@ -38,8 +38,8 @@ func New(logCtx logger.Info, logger log.Logger) (logger.Logger, error) {
 	if err != nil {
 		return nil, err
 	}
-	m := client.NewMetrics(prometheus.DefaultRegisterer, nil)
-	c, err := client.New(m, cfg.clientConfig, nil, logger)
+	m := client.NewMetrics(prometheus.DefaultRegisterer)
+	c, err := client.New(m, cfg.clientConfig, 0, 0, false, logger)
 	if err != nil {
 		return nil, err
 	}

@@ -3,14 +3,19 @@ package openshift
 import (
 	"fmt"
 	"math/rand"
+	"time"
+
+	lokiv1 "github.com/grafana/loki/operator/apis/loki/v1"
+	"github.com/grafana/loki/operator/internal/config"
 )
 
 // Options is the set of internal template options for rendering
-// the lokistack-gateway tenants configuration file when mode openshift-logging.
+// the lokistack-gateway tenants configuration file when mode openshift-logging or openshift-network.
 type Options struct {
 	BuildOpts      BuildOptions
 	Authentication []AuthenticationSpec
 	Authorization  AuthorizationSpec
+	TokenCCOAuth   *config.TokenCCOAuthConfig
 }
 
 // AuthenticationSpec describes the authentication specification
@@ -39,9 +44,11 @@ type BuildOptions struct {
 	GatewayName                     string
 	GatewaySvcName                  string
 	GatewaySvcTargetPort            string
+	GatewayRouteTimeout             time.Duration
+	RulerName                       string
 	Labels                          map[string]string
-	EnableServiceMonitors           bool
-	EnableCertificateSigningService bool
+	AlertManagerEnabled             bool
+	UserWorkloadAlertManagerEnabled bool
 }
 
 // TenantData defines the existing cookieSecret for lokistack reconcile.
@@ -52,51 +59,58 @@ type TenantData struct {
 // NewOptions returns an openshift options struct.
 func NewOptions(
 	stackName, stackNamespace string,
-	gwName, gwBaseDomain, gwSvcName, gwPortName string,
+	gwName, gwSvcName, gwPortName string,
+	gwWriteTimeout time.Duration,
 	gwLabels map[string]string,
-	enableServiceMonitors bool,
-	enableCertSigningService bool,
-	tenantConfigMap map[string]TenantData,
-) Options {
-	host := ingressHost(stackName, stackNamespace, gwBaseDomain)
+	rulerName string,
+) *Options {
+	return &Options{
+		BuildOpts: BuildOptions{
+			LokiStackName:        stackName,
+			LokiStackNamespace:   stackNamespace,
+			GatewayName:          gwName,
+			GatewaySvcName:       gwSvcName,
+			GatewaySvcTargetPort: gwPortName,
+			GatewayRouteTimeout:  gwWriteTimeout + gatewayRouteTimeoutExtension,
+			Labels:               gwLabels,
+			RulerName:            rulerName,
+		},
+	}
+}
 
-	var authn []AuthenticationSpec
-	for _, name := range defaultTenants {
-		if tenantConfigMap != nil {
-			authn = append(authn, AuthenticationSpec{
-				TenantName:     name,
-				TenantID:       name,
-				ServiceAccount: gwName,
-				RedirectURL:    fmt.Sprintf("http://%s/openshift/%s/callback", host, name),
-				CookieSecret:   tenantConfigMap[name].CookieSecret,
-			})
-		} else {
-			authn = append(authn, AuthenticationSpec{
-				TenantName:     name,
-				TenantID:       name,
-				ServiceAccount: gwName,
-				RedirectURL:    fmt.Sprintf("http://%s/openshift/%s/callback", host, name),
-				CookieSecret:   newCookieSecret(),
-			})
+func (o *Options) WithTenantsForMode(mode lokiv1.ModeType, gwBaseDomain string, tenantConfigMap map[string]TenantData) *Options {
+	var (
+		authn []AuthenticationSpec
+		authz AuthorizationSpec
+		host  = ingressHost(o.BuildOpts.LokiStackName, o.BuildOpts.LokiStackNamespace, gwBaseDomain)
+	)
+
+	tenants := GetTenants(mode)
+	for _, name := range tenants {
+		cookieSecret := tenantConfigMap[name].CookieSecret
+		if cookieSecret == "" {
+			cookieSecret = newCookieSecret()
+		}
+
+		authn = append(authn, AuthenticationSpec{
+			TenantName:     name,
+			TenantID:       name,
+			ServiceAccount: o.BuildOpts.GatewayName,
+			RedirectURL:    fmt.Sprintf("https://%s/openshift/%s/callback", host, name),
+			CookieSecret:   cookieSecret,
+		})
+	}
+
+	if len(tenants) > 0 {
+		authz = AuthorizationSpec{
+			OPAUrl: fmt.Sprintf("http://localhost:%d/v1/data/%s/allow", GatewayOPAHTTPPort, opaDefaultPackage),
 		}
 	}
 
-	return Options{
-		BuildOpts: BuildOptions{
-			LokiStackName:                   stackName,
-			LokiStackNamespace:              stackNamespace,
-			GatewayName:                     gwName,
-			GatewaySvcName:                  gwSvcName,
-			GatewaySvcTargetPort:            gwPortName,
-			Labels:                          gwLabels,
-			EnableServiceMonitors:           enableServiceMonitors,
-			EnableCertificateSigningService: enableCertSigningService,
-		},
-		Authentication: authn,
-		Authorization: AuthorizationSpec{
-			OPAUrl: fmt.Sprintf("http://localhost:%d/v1/data/%s/allow", GatewayOPAHTTPPort, opaDefaultPackage),
-		},
-	}
+	o.Authentication = authn
+	o.Authorization = authz
+
+	return o
 }
 
 func newCookieSecret() string {

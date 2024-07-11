@@ -1,162 +1,143 @@
-package status_test
+package status
 
 import (
 	"context"
+	"fmt"
 	"testing"
 
-	lokiv1beta1 "github.com/grafana/loki/operator/api/v1beta1"
-	"github.com/grafana/loki/operator/internal/external/k8s/k8sfakes"
-	"github.com/grafana/loki/operator/internal/status"
 	"github.com/stretchr/testify/require"
-
-	v1 "k8s.io/api/core/v1"
-	apierrors "k8s.io/apimachinery/pkg/api/errors"
+	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
-	"k8s.io/apimachinery/pkg/runtime/schema"
-	"k8s.io/apimachinery/pkg/types"
-	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+
+	lokiv1 "github.com/grafana/loki/operator/apis/loki/v1"
+	"github.com/grafana/loki/operator/internal/external/k8s/k8sfakes"
+	"github.com/grafana/loki/operator/internal/manifests"
 )
 
-func TestSetComponentsStatus_WhenGetLokiStackReturnsError_ReturnError(t *testing.T) {
-	k := &k8sfakes.FakeClient{}
-
-	r := ctrl.Request{
-		NamespacedName: types.NamespacedName{
-			Name:      "my-stack",
-			Namespace: "some-ns",
-		},
-	}
-
-	k.GetStub = func(_ context.Context, name types.NamespacedName, object client.Object) error {
-		return apierrors.NewBadRequest("something wasn't found")
-	}
-
-	err := status.SetComponentsStatus(context.TODO(), k, r)
-	require.Error(t, err)
-}
-
-func TestSetComponentsStatus_WhenGetLokiStackReturnsNotFound_DoNothing(t *testing.T) {
-	k := &k8sfakes.FakeClient{}
-
-	r := ctrl.Request{
-		NamespacedName: types.NamespacedName{
-			Name:      "my-stack",
-			Namespace: "some-ns",
-		},
-	}
-
-	k.GetStub = func(_ context.Context, name types.NamespacedName, object client.Object) error {
-		return apierrors.NewNotFound(schema.GroupResource{}, "something wasn't found")
-	}
-
-	err := status.SetComponentsStatus(context.TODO(), k, r)
-	require.NoError(t, err)
-}
-
-func TestSetComponentsStatus_WhenListReturnError_ReturnError(t *testing.T) {
-	sw := &k8sfakes.FakeStatusWriter{}
-	k := &k8sfakes.FakeClient{}
-
-	k.StatusStub = func() client.StatusWriter { return sw }
-
-	s := lokiv1beta1.LokiStack{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:      "my-stack",
-			Namespace: "some-ns",
-		},
-	}
-
-	r := ctrl.Request{
-		NamespacedName: types.NamespacedName{
-			Name:      "my-stack",
-			Namespace: "some-ns",
-		},
-	}
-
-	k.GetStub = func(_ context.Context, name types.NamespacedName, object client.Object) error {
-		if r.Name == name.Name && r.Namespace == name.Namespace {
-			k.SetClientObject(object, &s)
-			return nil
-		}
-		return apierrors.NewNotFound(schema.GroupResource{}, "something wasn't found")
-	}
-
-	k.ListStub = func(_ context.Context, l client.ObjectList, opts ...client.ListOption) error {
-		return apierrors.NewNotFound(schema.GroupResource{}, "something wasn't found")
-	}
-
-	err := status.SetComponentsStatus(context.TODO(), k, r)
-	require.Error(t, err)
-}
-
-func TestSetComponentsStatus_WhenPodListExisting_SetPodStatusMap(t *testing.T) {
-	sw := &k8sfakes.FakeStatusWriter{}
-	k := &k8sfakes.FakeClient{}
-
-	k.StatusStub = func() client.StatusWriter { return sw }
-
-	s := lokiv1beta1.LokiStack{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:      "my-stack",
-			Namespace: "some-ns",
-		},
-	}
-
-	r := ctrl.Request{
-		NamespacedName: types.NamespacedName{
-			Name:      "my-stack",
-			Namespace: "some-ns",
-		},
-	}
-
-	k.GetStub = func(_ context.Context, name types.NamespacedName, object client.Object) error {
-		if r.Name == name.Name && r.Namespace == name.Namespace {
-			k.SetClientObject(object, &s)
-			return nil
-		}
-		return apierrors.NewNotFound(schema.GroupResource{}, "something wasn't found")
-	}
-
-	k.ListStub = func(_ context.Context, l client.ObjectList, _ ...client.ListOption) error {
-		pods := v1.PodList{
-			Items: []v1.Pod{
-				{
-					ObjectMeta: metav1.ObjectMeta{
-						Name: "pod-a",
-					},
-					Status: v1.PodStatus{
-						Phase: v1.PodPending,
-					},
-				},
-				{
-					ObjectMeta: metav1.ObjectMeta{
-						Name: "pod-b",
-					},
-					Status: v1.PodStatus{
-						Phase: v1.PodRunning,
+func createPodList(baseName string, ready bool, phases ...corev1.PodPhase) *corev1.PodList {
+	items := []corev1.Pod{}
+	for i, p := range phases {
+		items = append(items, corev1.Pod{
+			ObjectMeta: metav1.ObjectMeta{
+				Name: fmt.Sprintf("%s-pod-%d", baseName, i),
+			},
+			Status: corev1.PodStatus{
+				Phase: p,
+				ContainerStatuses: []corev1.ContainerStatus{
+					{
+						Ready: ready,
 					},
 				},
 			},
+		})
+	}
+
+	return &corev1.PodList{
+		Items: items,
+	}
+}
+
+func setupListClient(t *testing.T, stack *lokiv1.LokiStack, componentPods map[string]*corev1.PodList) (*k8sfakes.FakeClient, *k8sfakes.FakeStatusWriter) {
+	k, sw := setupFakesNoError(t, stack)
+	k.ListStub = func(_ context.Context, list client.ObjectList, options ...client.ListOption) error {
+		componentLabel := ""
+		for _, o := range options {
+			if m, ok := o.(client.MatchingLabels); ok {
+				componentLabel = m["app.kubernetes.io/component"]
+			}
 		}
-		k.SetClientObjectList(l, &pods)
+
+		if componentLabel == "" {
+			t.Fatalf("no component label on list call: %s", options)
+		}
+
+		podList, ok := componentPods[componentLabel]
+		if !ok {
+			t.Fatalf("no pods found for label: %s", componentLabel)
+		}
+
+		k.SetClientObjectList(list, podList)
 		return nil
 	}
 
-	expected := lokiv1beta1.PodStatusMap{
-		"Pending": []string{"pod-a"},
-		"Running": []string{"pod-b"},
+	return k, sw
+}
+
+func TestGenerateComponentStatus(t *testing.T) {
+	tt := []struct {
+		desc                string
+		componentPods       map[string]*corev1.PodList
+		wantComponentStatus *lokiv1.LokiStackComponentStatus
+	}{
+		{
+			desc: "no pods",
+			componentPods: map[string]*corev1.PodList{
+				manifests.LabelCompactorComponent:     {},
+				manifests.LabelDistributorComponent:   {},
+				manifests.LabelIngesterComponent:      {},
+				manifests.LabelQuerierComponent:       {},
+				manifests.LabelQueryFrontendComponent: {},
+				manifests.LabelIndexGatewayComponent:  {},
+				manifests.LabelRulerComponent:         {},
+				manifests.LabelGatewayComponent:       {},
+			},
+			wantComponentStatus: &lokiv1.LokiStackComponentStatus{
+				Compactor:     lokiv1.PodStatusMap{},
+				Distributor:   lokiv1.PodStatusMap{},
+				IndexGateway:  lokiv1.PodStatusMap{},
+				Ingester:      lokiv1.PodStatusMap{},
+				Querier:       lokiv1.PodStatusMap{},
+				QueryFrontend: lokiv1.PodStatusMap{},
+				Gateway:       lokiv1.PodStatusMap{},
+				Ruler:         lokiv1.PodStatusMap{},
+			},
+		},
+		{
+			desc: "all one pod running",
+			componentPods: map[string]*corev1.PodList{
+				manifests.LabelCompactorComponent:     createPodList(manifests.LabelCompactorComponent, false, corev1.PodRunning),
+				manifests.LabelDistributorComponent:   createPodList(manifests.LabelDistributorComponent, false, corev1.PodRunning),
+				manifests.LabelIngesterComponent:      createPodList(manifests.LabelIngesterComponent, false, corev1.PodRunning),
+				manifests.LabelQuerierComponent:       createPodList(manifests.LabelQuerierComponent, false, corev1.PodRunning),
+				manifests.LabelQueryFrontendComponent: createPodList(manifests.LabelQueryFrontendComponent, false, corev1.PodRunning),
+				manifests.LabelIndexGatewayComponent:  createPodList(manifests.LabelIndexGatewayComponent, false, corev1.PodRunning),
+				manifests.LabelRulerComponent:         createPodList(manifests.LabelRulerComponent, false, corev1.PodRunning),
+				manifests.LabelGatewayComponent:       createPodList(manifests.LabelGatewayComponent, false, corev1.PodRunning),
+			},
+			wantComponentStatus: &lokiv1.LokiStackComponentStatus{
+				Compactor:     lokiv1.PodStatusMap{lokiv1.PodRunning: {"compactor-pod-0"}},
+				Distributor:   lokiv1.PodStatusMap{lokiv1.PodRunning: {"distributor-pod-0"}},
+				IndexGateway:  lokiv1.PodStatusMap{lokiv1.PodRunning: {"index-gateway-pod-0"}},
+				Ingester:      lokiv1.PodStatusMap{lokiv1.PodRunning: {"ingester-pod-0"}},
+				Querier:       lokiv1.PodStatusMap{lokiv1.PodRunning: {"querier-pod-0"}},
+				QueryFrontend: lokiv1.PodStatusMap{lokiv1.PodRunning: {"query-frontend-pod-0"}},
+				Gateway:       lokiv1.PodStatusMap{lokiv1.PodRunning: {"lokistack-gateway-pod-0"}},
+				Ruler:         lokiv1.PodStatusMap{lokiv1.PodRunning: {"ruler-pod-0"}},
+			},
+		},
 	}
 
-	sw.UpdateStub = func(_ context.Context, obj client.Object, _ ...client.UpdateOption) error {
-		stack := obj.(*lokiv1beta1.LokiStack)
-		require.Equal(t, expected, stack.Status.Components.Compactor)
-		return nil
-	}
+	for _, tc := range tt {
+		tc := tc
+		t.Run(tc.desc, func(t *testing.T) {
+			t.Parallel()
 
-	err := status.SetComponentsStatus(context.TODO(), k, r)
-	require.NoError(t, err)
-	require.NotZero(t, k.ListCallCount())
-	require.NotZero(t, k.StatusCallCount())
-	require.NotZero(t, sw.UpdateCallCount())
+			stack := &lokiv1.LokiStack{
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "my-stack",
+					Namespace: "some-ns",
+				},
+			}
+
+			k, _ := setupListClient(t, stack, tc.componentPods)
+
+			componentStatus, err := generateComponentStatus(context.Background(), k, stack)
+			require.NoError(t, err)
+			require.Equal(t, tc.wantComponentStatus, componentStatus)
+
+			// one list call for each component
+			require.Equal(t, 8, k.ListCallCount())
+		})
+	}
 }

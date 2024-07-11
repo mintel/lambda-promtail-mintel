@@ -9,6 +9,7 @@ import (
 	"html/template"
 	"io"
 	"net/http"
+	"net/url"
 	"strings"
 
 	"github.com/go-kit/log"
@@ -41,6 +42,24 @@ func (b *BasicAuth) RegisterFlagsWithPrefix(prefix string, f *flag.FlagSet) {
 // IsEnabled returns false if basic authentication isn't enabled.
 func (b BasicAuth) IsEnabled() bool {
 	return b.Username != "" || b.Password != ""
+}
+
+// HeaderAuth condigures header based authorization for HTTP clients.
+type HeaderAuth struct {
+	Type            string `yaml:"type,omitempty"`
+	Credentials     string `yaml:"credentials,omitempty"`
+	CredentialsFile string `yaml:"credentials_file,omitempty"`
+}
+
+func (h *HeaderAuth) RegisterFlagsWithPrefix(prefix string, f *flag.FlagSet) {
+	f.StringVar(&h.Type, prefix+"type", "Bearer", "HTTP Header authorization type (default: Bearer).")
+	f.StringVar(&h.Credentials, prefix+"credentials", "", "HTTP Header authorization credentials.")
+	f.StringVar(&h.CredentialsFile, prefix+"credentials-file", "", "HTTP Header authorization credentials file.")
+}
+
+// IsEnabled returns false if header authorization isn't enabled.
+func (h HeaderAuth) IsEnabled() bool {
+	return h.Credentials != "" || h.CredentialsFile != ""
 }
 
 // WriteJSONResponse writes some JSON as a HTTP response.
@@ -209,25 +228,26 @@ func decompressFromReader(reader io.Reader, expectedSize, maxSize int, compressi
 }
 
 func decompressFromBuffer(buffer *bytes.Buffer, maxSize int, compression CompressionType, sp opentracing.Span) ([]byte, error) {
-	if len(buffer.Bytes()) > maxSize {
-		return nil, fmt.Errorf(messageSizeLargerErrFmt, len(buffer.Bytes()), maxSize)
+	bufBytes := buffer.Bytes()
+	if len(bufBytes) > maxSize {
+		return nil, fmt.Errorf(messageSizeLargerErrFmt, len(bufBytes), maxSize)
 	}
 	switch compression {
 	case NoCompression:
-		return buffer.Bytes(), nil
+		return bufBytes, nil
 	case RawSnappy:
 		if sp != nil {
 			sp.LogFields(otlog.String("event", "util.ParseProtoRequest[decompress]"),
-				otlog.Int("size", len(buffer.Bytes())))
+				otlog.Int("size", len(bufBytes)))
 		}
-		size, err := snappy.DecodedLen(buffer.Bytes())
+		size, err := snappy.DecodedLen(bufBytes)
 		if err != nil {
 			return nil, err
 		}
 		if size > maxSize {
 			return nil, fmt.Errorf(messageSizeLargerErrFmt, size, maxSize)
 		}
-		body, err := snappy.Decode(nil, buffer.Bytes())
+		body, err := snappy.Decode(nil, bufBytes)
 		if err != nil {
 			return nil, err
 		}
@@ -266,4 +286,15 @@ func SerializeProtoResponse(w http.ResponseWriter, resp proto.Message, compressi
 		return fmt.Errorf("error sending proto response: %v", err)
 	}
 	return nil
+}
+
+func FlagFromValues(values url.Values, key string, d bool) bool {
+	switch strings.ToLower(values.Get(key)) {
+	case "t", "true", "1":
+		return true
+	case "f", "false", "0":
+		return false
+	default:
+		return d
+	}
 }

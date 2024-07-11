@@ -3,11 +3,11 @@ package querytee
 import (
 	"context"
 	"io"
-	"io/ioutil"
 	"net"
 	"net/http"
 	"net/url"
 	"path"
+	"regexp"
 	"time"
 
 	"github.com/pkg/errors"
@@ -23,6 +23,9 @@ type ProxyBackend struct {
 	// Whether this is the preferred backend from which picking up
 	// the response and sending it back to the client.
 	preferred bool
+
+	// Only process requests that match the filter.
+	filter *regexp.Regexp
 }
 
 // NewProxyBackend makes a new ProxyBackend
@@ -49,6 +52,11 @@ func NewProxyBackend(name string, endpoint *url.URL, timeout time.Duration, pref
 			},
 		},
 	}
+}
+
+func (b *ProxyBackend) WithFilter(f *regexp.Regexp) *ProxyBackend {
+	b.filter = f
+	return b
 }
 
 func (b *ProxyBackend) ForwardRequest(orig *http.Request, body io.ReadCloser) (int, []byte, error) {
@@ -107,7 +115,7 @@ func (b *ProxyBackend) doBackendRequest(req *http.Request) (int, []byte, error) 
 
 	// Read the entire response body.
 	defer res.Body.Close()
-	body, err := ioutil.ReadAll(res.Body)
+	body, err := io.ReadAll(res.Body)
 	if err != nil {
 		return 0, nil, errors.Wrap(err, "reading backend response")
 	}

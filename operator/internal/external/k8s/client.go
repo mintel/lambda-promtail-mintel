@@ -5,7 +5,7 @@ import (
 
 	"k8s.io/apimachinery/pkg/api/meta"
 	"k8s.io/apimachinery/pkg/runtime"
-
+	"k8s.io/apimachinery/pkg/runtime/schema"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 )
 
@@ -17,7 +17,7 @@ import (
 //counterfeiter:generate . Client
 type Client interface {
 	Create(ctx context.Context, obj client.Object, opts ...client.CreateOption) error
-	Get(ctx context.Context, key client.ObjectKey, obj client.Object) error
+	Get(ctx context.Context, key client.ObjectKey, obj client.Object, opts ...client.GetOption) error
 
 	Update(ctx context.Context, obj client.Object, opts ...client.UpdateOption) error
 	Delete(ctx context.Context, obj client.Object, opts ...client.DeleteOption) error
@@ -28,7 +28,10 @@ type Client interface {
 	RESTMapper() meta.RESTMapper
 	Scheme() *runtime.Scheme
 
+	GroupVersionKindFor(obj runtime.Object) (schema.GroupVersionKind, error)
+	IsObjectNamespaced(obj runtime.Object) (bool, error)
 	Status() client.StatusWriter
+	SubResource(subResource string) client.SubResourceClient
 }
 
 // StatusWriter is a kubernetes status writer interface used internally. It copies functions from
@@ -36,6 +39,19 @@ type Client interface {
 //
 //counterfeiter:generate . StatusWriter
 type StatusWriter interface {
-	Update(ctx context.Context, obj client.Object, opts ...client.UpdateOption) error
-	Patch(ctx context.Context, obj client.Object, patch client.Patch, opts ...client.PatchOption) error
+	Create(ctx context.Context, obj client.Object, subResource client.Object, opts ...client.SubResourceCreateOption) error
+	Update(ctx context.Context, obj client.Object, opts ...client.SubResourceUpdateOption) error
+	Patch(ctx context.Context, obj client.Object, patch client.Patch, opts ...client.SubResourcePatchOption) error
+}
+
+// SubResourceClient is a kubernetes status writer interface used internally. It copies functions from
+// sigs.k8s.io/controller-runtime/pkg/client
+//
+//counterfeiter:generate . SubResourceClient
+type SubResourceClient interface {
+	Get(ctx context.Context, obj client.Object, subResource client.Object, opts ...client.SubResourceGetOption) error
+
+	Create(ctx context.Context, obj client.Object, subResource client.Object, opts ...client.SubResourceCreateOption) error
+	Update(ctx context.Context, obj client.Object, opts ...client.SubResourceUpdateOption) error
+	Patch(ctx context.Context, obj client.Object, patch client.Patch, opts ...client.SubResourcePatchOption) error
 }

@@ -3,7 +3,6 @@ package server
 import (
 	"context"
 	"io"
-	"io/ioutil"
 	"net/http"
 	"net/url"
 	"path"
@@ -14,7 +13,7 @@ import (
 	"github.com/prometheus/common/model"
 	"github.com/prometheus/prometheus/template"
 
-	"github.com/grafana/loki/clients/pkg/promtail/server/ui"
+	"github.com/grafana/loki/v3/clients/pkg/promtail/server/ui"
 )
 
 // templateOptions is a set of options to render a template.
@@ -77,7 +76,7 @@ func getTemplate(name string) (string, error) {
 		defer func() {
 			_ = f.Close()
 		}()
-		b, err := ioutil.ReadAll(f)
+		b, err := io.ReadAll(f)
 		if err != nil {
 			return err
 		}

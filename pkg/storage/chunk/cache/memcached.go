@@ -8,15 +8,15 @@ import (
 	"sync"
 	"time"
 
-	"github.com/bradfitz/gomemcache/memcache"
 	"github.com/go-kit/log"
-	"github.com/go-kit/log/level"
+	instr "github.com/grafana/dskit/instrument"
+	"github.com/grafana/gomemcache/memcache"
 	"github.com/prometheus/client_golang/prometheus"
 	"github.com/prometheus/client_golang/prometheus/promauto"
-	instr "github.com/weaveworks/common/instrument"
 
-	util_log "github.com/grafana/loki/pkg/util/log"
-	"github.com/grafana/loki/pkg/util/math"
+	"github.com/grafana/loki/v3/pkg/logqlmodel/stats"
+	"github.com/grafana/loki/v3/pkg/util/constants"
+	"github.com/grafana/loki/v3/pkg/util/math"
 )
 
 // MemcachedConfig is config to make a Memcached
@@ -30,41 +30,53 @@ type MemcachedConfig struct {
 // RegisterFlagsWithPrefix adds the flags required to config this to the given FlagSet
 func (cfg *MemcachedConfig) RegisterFlagsWithPrefix(prefix, description string, f *flag.FlagSet) {
 	f.DurationVar(&cfg.Expiration, prefix+"memcached.expiration", 0, description+"How long keys stay in the memcache.")
-	f.IntVar(&cfg.BatchSize, prefix+"memcached.batchsize", 1024, description+"How many keys to fetch in each batch.")
-	f.IntVar(&cfg.Parallelism, prefix+"memcached.parallelism", 100, description+"Maximum active requests to memcache.")
+	f.IntVar(&cfg.BatchSize, prefix+"memcached.batchsize", 4, description+"How many keys to fetch in each batch.")
+	f.IntVar(&cfg.Parallelism, prefix+"memcached.parallelism", 5, description+"Maximum active requests to memcache.")
 }
 
 // Memcached type caches chunks in memcached
 type Memcached struct {
-	cfg      MemcachedConfig
-	memcache MemcachedClient
-	name     string
+	cfg       MemcachedConfig
+	memcache  MemcachedClient
+	name      string
+	cacheType stats.CacheType
 
 	requestDuration *instr.HistogramCollector
 
 	wg      sync.WaitGroup
 	inputCh chan *work
 
+	// `closed` tracks if `inputCh` is closed.
+	// So that any writer goroutine wouldn't write to it after closing `intputCh`
+	closed chan struct{}
+
 	logger log.Logger
 }
 
 // NewMemcached makes a new Memcached.
-func NewMemcached(cfg MemcachedConfig, client MemcachedClient, name string, reg prometheus.Registerer, logger log.Logger) *Memcached {
+func NewMemcached(cfg MemcachedConfig, client MemcachedClient, name string, reg prometheus.Registerer, logger log.Logger, cacheType stats.CacheType) *Memcached {
 	c := &Memcached{
-		cfg:      cfg,
-		memcache: client,
-		name:     name,
-		logger:   logger,
+		cfg:       cfg,
+		memcache:  client,
+		name:      name,
+		logger:    logger,
+		cacheType: cacheType,
 		requestDuration: instr.NewHistogramCollector(
 			promauto.With(reg).NewHistogramVec(prometheus.HistogramOpts{
-				Namespace: "loki",
+				Namespace: constants.Loki,
 				Name:      "memcache_request_duration_seconds",
 				Help:      "Total time spent in seconds doing memcache requests.",
-				// Memcached requests are very quick: smallest bucket is 16us, biggest is 1s
-				Buckets:     prometheus.ExponentialBuckets(0.000016, 4, 8),
+				// 16us, 64us, 256us, 1.024ms, 4.096ms, 16.384ms, 65.536ms, 150ms, 250ms, 500ms, 1s
+				Buckets: append(prometheus.ExponentialBuckets(0.000016, 4, 7), []float64{
+					(150 * time.Millisecond).Seconds(),
+					(250 * time.Millisecond).Seconds(),
+					(500 * time.Millisecond).Seconds(),
+					(time.Second).Seconds(),
+				}...),
 				ConstLabels: prometheus.Labels{"name": name},
 			}, []string{"method", "status_code"}),
 		),
+		closed: make(chan struct{}),
 	}
 
 	if cfg.BatchSize == 0 || cfg.Parallelism == 0 {
@@ -76,6 +88,7 @@ func NewMemcached(cfg MemcachedConfig, client MemcachedClient, name string, reg 
 
 	for i := 0; i < cfg.Parallelism; i++ {
 		go func() {
+			defer c.wg.Done()
 			for input := range c.inputCh {
 				res := &result{
 					batchID: input.batchID,
@@ -84,7 +97,6 @@ func NewMemcached(cfg MemcachedConfig, client MemcachedClient, name string, reg 
 				input.resultCh <- res
 			}
 
-			c.wg.Done()
 		}()
 	}
 
@@ -107,7 +119,7 @@ type result struct {
 }
 
 func memcacheStatusCode(err error) string {
-	// See https://godoc.org/github.com/bradfitz/gomemcache/memcache#pkg-variables
+	// See https://godoc.org/github.com/grafana/gomemcache/memcache#pkg-variables
 	switch err {
 	case nil:
 		return "200"
@@ -141,11 +153,6 @@ func (c *Memcached) fetch(ctx context.Context, keys []string) (found []string, b
 	items, err = c.memcache.GetMulti(keys)
 	c.requestDuration.After(ctx, "Memcache.GetMulti", memcacheStatusCode(err), start)
 	if err != nil {
-		level.Error(util_log.WithContext(ctx, c.logger)).Log(
-			"msg", "Failed to get keys from memcached",
-			"keys requested", len(keys),
-			"err", err,
-		)
 		return found, bufs, keys, err
 	}
 
@@ -168,13 +175,18 @@ func (c *Memcached) fetchKeysBatched(ctx context.Context, keys []string) (found 
 	go func() {
 		for i, j := 0, 0; i < len(keys); i += batchSize {
 			batchKeys := keys[i:math.Min(i+batchSize, len(keys))]
-			c.inputCh <- &work{
-				keys:     batchKeys,
-				ctx:      ctx,
-				resultCh: resultsCh,
-				batchID:  j,
+			select {
+			case <-c.closed:
+				return
+			default:
+				c.inputCh <- &work{
+					keys:     batchKeys,
+					ctx:      ctx,
+					resultCh: resultsCh,
+					batchID:  j,
+				}
+				j++
 			}
-			j++
 		}
 	}()
 
@@ -187,8 +199,17 @@ func (c *Memcached) fetchKeysBatched(ctx context.Context, keys []string) (found 
 	// We need to order found by the input keys order.
 	results := make([]*result, numResults)
 	for i := 0; i < numResults; i++ {
-		result := <-resultsCh
-		results[result.batchID] = result
+		// NOTE: Without this check, <-resultCh may wait forever as work is
+		// interrupted (by other goroutine by calling `Stop()`) and there may not be `numResults`
+		// values to read from `resultsCh` in that case.
+		// Also we do close(resultsCh) in the same goroutine so <-resultCh may never return.
+		select {
+		case <-c.closed:
+			return
+		default:
+			result := <-resultsCh
+			results[result.batchID] = result
+		}
 	}
 	close(resultsCh)
 
@@ -217,21 +238,24 @@ func (c *Memcached) Store(ctx context.Context, keys []string, bufs [][]byte) err
 			return c.memcache.Set(&item)
 		})
 		if cacheErr != nil {
-			level.Error(c.logger).Log("msg", "failed to put to memcached", "name", c.name, "err", err)
 			err = cacheErr
 		}
 	}
 	return err
 }
 
-// Stop does nothing.
 func (c *Memcached) Stop() {
 	if c.inputCh == nil {
 		return
 	}
 
 	close(c.inputCh)
+	close(c.closed)
 	c.wg.Wait()
+}
+
+func (c *Memcached) GetCacheType() stats.CacheType {
+	return c.cacheType
 }
 
 // HashKey hashes key into something you can store in memcached.

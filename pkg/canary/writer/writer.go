@@ -2,19 +2,27 @@ package writer
 
 import (
 	"fmt"
-	"io"
 	"math/rand"
 	"strconv"
 	"strings"
 	"time"
+
+	"github.com/go-kit/log"
 )
 
 const (
 	LogEntry = "%s %s\n"
 )
 
+type EntryWriter interface {
+	// WriteEntry handles sending the log to the output
+	// To maintain consistent log timing, Write is expected to be non-blocking
+	WriteEntry(ts time.Time, entry string)
+	Stop()
+}
+
 type Writer struct {
-	w                    io.Writer
+	w                    EntryWriter
 	sent                 chan time.Time
 	interval             time.Duration
 	outOfOrderPercentage int
@@ -25,9 +33,17 @@ type Writer struct {
 	pad                  string
 	quit                 chan struct{}
 	done                 chan struct{}
+
+	logger log.Logger
 }
 
-func NewWriter(writer io.Writer, sentChan chan time.Time, entryInterval, outOfOrderMin, outOfOrderMax time.Duration, outOfOrderPercentage, entrySize int) *Writer {
+func NewWriter(
+	writer EntryWriter,
+	sentChan chan time.Time,
+	entryInterval, outOfOrderMin, outOfOrderMax time.Duration,
+	outOfOrderPercentage, entrySize int,
+	logger log.Logger,
+) *Writer {
 
 	w := &Writer{
 		w:                    writer,
@@ -40,6 +56,7 @@ func NewWriter(writer io.Writer, sentChan chan time.Time, entryInterval, outOfOr
 		prevTsLen:            0,
 		quit:                 make(chan struct{}),
 		done:                 make(chan struct{}),
+		logger:               logger,
 	}
 
 	go w.run()
@@ -83,7 +100,7 @@ func (w *Writer) run() {
 				w.prevTsLen = tsLen
 			}
 
-			fmt.Fprintf(w.w, LogEntry, ts, w.pad)
+			w.w.WriteEntry(t, fmt.Sprintf(LogEntry, ts, w.pad))
 			w.sent <- t
 		case <-w.quit:
 			return

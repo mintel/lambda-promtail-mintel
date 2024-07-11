@@ -6,16 +6,19 @@ import (
 	"sort"
 	"strings"
 	"sync"
-	"text/scanner"
 
 	"github.com/prometheus/prometheus/model/labels"
 	promql_parser "github.com/prometheus/prometheus/promql/parser"
 
-	"github.com/grafana/loki/pkg/logqlmodel"
-	"github.com/grafana/loki/pkg/util"
+	"github.com/grafana/loki/v3/pkg/logqlmodel"
+	"github.com/grafana/loki/v3/pkg/util"
 )
 
-const errAtleastOneEqualityMatcherRequired = "queries require at least one regexp or equality matcher that does not have an empty-compatible value. For instance, app=~\".*\" does not meet this requirement, but app=~\".+\" will"
+const (
+	EmptyMatchers = "{}"
+
+	errAtleastOneEqualityMatcherRequired = "queries require at least one regexp or equality matcher that does not have an empty-compatible value. For instance, app=~\".*\" does not meet this requirement, but app=~\".+\" will"
+)
 
 var parserPool = sync.Pool{
 	New: func() interface{} {
@@ -28,7 +31,13 @@ var parserPool = sync.Pool{
 	},
 }
 
-const maxInputSize = 5120
+// (E.Welch) We originally added this limit from fuzz testing and realizing there should be some maximum limit to an allowed query size.
+// The original limit was 5120 based on some internet searching and a best estimate of what a reasonable limit would be.
+// We have seen use cases with queries containing a lot of filter expressions or long expanded variable names where this limit was too small.
+// Apparently the spec does not specify a limit, and more internet searching suggests almost all browsers will handle 100k+ length urls without issue
+// Some limit here still seems prudent however, so the new limit is now 128k.
+// Also note this is used to allocate the buffer for reading the query string, so there is some memory cost to making this larger.
+const maxInputSize = 131072
 
 func init() {
 	// Improve the error messages coming out of yacc.
@@ -49,7 +58,7 @@ type parser struct {
 
 func (p *parser) Parse() (Expr, error) {
 	p.lexer.errs = p.lexer.errs[:0]
-	p.lexer.Scanner.Error = func(_ *scanner.Scanner, msg string) {
+	p.lexer.Scanner.Error = func(_ *Scanner, msg string) {
 		p.lexer.Error(msg)
 	}
 	e := p.p.Parse(p)
@@ -61,7 +70,7 @@ func (p *parser) Parse() (Expr, error) {
 
 // ParseExpr parses a string and returns an Expr.
 func ParseExpr(input string) (Expr, error) {
-	expr, err := parseExprWithoutValidation(input)
+	expr, err := ParseExprWithoutValidation(input)
 	if err != nil {
 		return nil, err
 	}
@@ -71,7 +80,7 @@ func ParseExpr(input string) (Expr, error) {
 	return expr, nil
 }
 
-func parseExprWithoutValidation(input string) (expr Expr, err error) {
+func ParseExprWithoutValidation(input string) (expr Expr, err error) {
 	if len(input) >= maxInputSize {
 		return nil, logqlmodel.NewParseError(fmt.Sprintf("input size too long (%d > %d)", len(input), maxInputSize), 0, 0)
 	}
@@ -96,49 +105,60 @@ func parseExprWithoutValidation(input string) (expr Expr, err error) {
 	return p.Parse()
 }
 
+func MustParseExpr(input string) Expr {
+	expr, err := ParseExpr(input)
+	if err != nil {
+		panic(err)
+	}
+	return expr
+}
+
 func validateExpr(expr Expr) error {
 	switch e := expr.(type) {
 	case SampleExpr:
-		err := validateSampleExpr(e)
-		if err != nil {
-			return err
-		}
+		return validateSampleExpr(e)
 	case LogSelectorExpr:
-		err := validateMatchers(e.Matchers())
-		if err != nil {
-			return err
-		}
+		return validateLogSelectorExpression(e)
 	default:
 		return logqlmodel.NewParseError(fmt.Sprintf("unexpected expression type: %v", e), 0, 0)
 	}
-	return nil
 }
 
 // validateMatchers checks whether a query would touch all the streams in the query range or uses at least one matcher to select specific streams.
 func validateMatchers(matchers []*labels.Matcher) error {
-	if len(matchers) == 0 {
-		return nil
-	}
 	_, matchers = util.SplitFiltersAndMatchers(matchers)
 	if len(matchers) == 0 {
 		return logqlmodel.NewParseError(errAtleastOneEqualityMatcherRequired, 0, 0)
 	}
-
 	return nil
 }
 
 // ParseMatchers parses a string and returns labels matchers, if the expression contains
 // anything else it will return an error.
-func ParseMatchers(input string) ([]*labels.Matcher, error) {
-	expr, err := ParseExpr(input)
+func ParseMatchers(input string, validate bool) ([]*labels.Matcher, error) {
+	var (
+		expr Expr
+		err  error
+	)
+
+	if validate {
+		expr, err = ParseExpr(input)
+	} else {
+		expr, err = ParseExprWithoutValidation(input)
+	}
+
 	if err != nil {
 		return nil, err
 	}
 	matcherExpr, ok := expr.(*MatchersExpr)
 	if !ok {
-		return nil, errors.New("only label matchers is supported")
+		return nil, logqlmodel.ErrParseMatchers
 	}
 	return matcherExpr.Mts, nil
+}
+
+func MatchersString(xs []*labels.Matcher) string {
+	return newMatcherExpr(xs).String()
 }
 
 // ParseSampleExpr parses a string and returns the sampleExpr
@@ -158,21 +178,63 @@ func ParseSampleExpr(input string) (SampleExpr, error) {
 func validateSampleExpr(expr SampleExpr) error {
 	switch e := expr.(type) {
 	case *BinOpExpr:
+		if e.err != nil {
+			return e.err
+		}
 		if err := validateSampleExpr(e.SampleExpr); err != nil {
 			return err
 		}
-
 		return validateSampleExpr(e.RHS)
 	case *LiteralExpr:
+		if e.err != nil {
+			return e.err
+		}
+		return nil
+	case *VectorExpr:
+		if e.err != nil {
+			return e.err
+		}
+		return nil
+	case *VectorAggregationExpr:
+		if e.err != nil {
+			return e.err
+		}
+		if e.Operation == OpTypeSort || e.Operation == OpTypeSortDesc {
+			if err := validateSortGrouping(e.Grouping); err != nil {
+				return err
+			}
+		}
+		return validateSampleExpr(e.Left)
+	default:
+		selector, err := e.Selector()
+		if err != nil {
+			return err
+		}
+		return validateLogSelectorExpression(selector)
+	}
+}
+
+func validateLogSelectorExpression(expr LogSelectorExpr) error {
+	switch e := expr.(type) {
+	case *VectorExpr:
 		return nil
 	default:
-		return validateMatchers(expr.Selector().Matchers())
+		return validateMatchers(e.Matchers())
 	}
+}
+
+// validateSortGrouping prevent by|without groupings on sort operations.
+// This will keep compatibility with promql and allowing sort by (foo) doesn't make much sense anyway when sort orders by value instead of labels.
+func validateSortGrouping(grouping *Grouping) error {
+	if grouping != nil && len(grouping.Groups) > 0 {
+		return logqlmodel.NewParseError("sort and sort_desc doesn't allow grouping by ", 0, 0)
+	}
+	return nil
 }
 
 // ParseLogSelector parses a log selector expression `{app="foo"} |= "filter"`
 func ParseLogSelector(input string, validate bool) (LogSelectorExpr, error) {
-	expr, err := parseExprWithoutValidation(input)
+	expr, err := ParseExprWithoutValidation(input)
 	if err != nil {
 		return nil, err
 	}
@@ -194,6 +256,18 @@ func ParseLabels(lbs string) (labels.Labels, error) {
 	if err != nil {
 		return nil, err
 	}
+	// Sort labels to ensure functionally equivalent
+	// inputs map to the same output
 	sort.Sort(ls)
-	return ls, nil
+
+	// Use the label builder to trim empty label values.
+	// Empty label values are equivalent to absent labels
+	// in Prometheus, but they unfortunately alter the
+	// Hash values created. This can cause problems in Loki
+	// if we can't rely on a set of labels to have a deterministic
+	// hash value.
+	// Therefore we must normalize early in the write path.
+	// See https://github.com/grafana/loki/pull/7355
+	// for more information
+	return labels.NewBuilder(ls).Labels(), nil
 }

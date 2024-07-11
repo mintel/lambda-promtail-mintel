@@ -5,7 +5,7 @@ import (
 	"io"
 	"strings"
 
-	"github.com/thanos-io/thanos/pkg/objstore"
+	"github.com/thanos-io/objstore"
 )
 
 type PrefixedBucketClient struct {
@@ -82,6 +82,11 @@ func (b *PrefixedBucketClient) Attributes(ctx context.Context, name string) (obj
 // thanos_objstore_bucket_operation_failures_total metric.
 func (b *PrefixedBucketClient) ReaderWithExpectedErrs(fn objstore.IsOpFailureExpectedFunc) objstore.BucketReader {
 	return b.WithExpectedErrs(fn)
+}
+
+// IsAccessDeniedErr returns true if access to object is denied.
+func (b *PrefixedBucketClient) IsAccessDeniedErr(err error) bool {
+	return b.bucket.IsAccessDeniedErr(err)
 }
 
 // ReaderWithExpectedErrs allows to specify a filter that marks certain errors as expected, so it will not increment

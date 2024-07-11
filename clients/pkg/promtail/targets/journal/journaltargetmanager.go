@@ -1,17 +1,16 @@
-//go:build !linux || !cgo
-// +build !linux !cgo
+//go:build !linux || !cgo || !promtail_journal_enabled
+// +build !linux !cgo !promtail_journal_enabled
 
 package journal
 
 import (
 	"github.com/go-kit/log"
 	"github.com/go-kit/log/level"
-	"github.com/prometheus/client_golang/prometheus"
 
-	"github.com/grafana/loki/clients/pkg/promtail/api"
-	"github.com/grafana/loki/clients/pkg/promtail/positions"
-	"github.com/grafana/loki/clients/pkg/promtail/scrapeconfig"
-	"github.com/grafana/loki/clients/pkg/promtail/targets/target"
+	"github.com/grafana/loki/v3/clients/pkg/promtail/api"
+	"github.com/grafana/loki/v3/clients/pkg/promtail/positions"
+	"github.com/grafana/loki/v3/clients/pkg/promtail/scrapeconfig"
+	"github.com/grafana/loki/v3/clients/pkg/promtail/targets/target"
 )
 
 // JournalTargetManager manages a series of JournalTargets.
@@ -21,11 +20,11 @@ type JournalTargetManager struct{}
 // NewJournalTargetManager returns nil as JournalTargets are not supported
 // on this platform.
 func NewJournalTargetManager(
-	reg prometheus.Registerer,
+	_ *Metrics,
 	logger log.Logger,
-	positions positions.Positions,
-	client api.EntryHandler,
-	scrapeConfigs []scrapeconfig.Config,
+	_ positions.Positions,
+	_ api.EntryHandler,
+	_ []scrapeconfig.Config,
 ) (*JournalTargetManager, error) {
 	level.Warn(logger).Log("msg", "WARNING!!! Journal target was configured but support for reading the systemd journal is not compiled into this build of promtail!")
 	return &JournalTargetManager{}, nil

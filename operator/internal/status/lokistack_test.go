@@ -1,691 +1,284 @@
-package status_test
+package status
 
 import (
 	"context"
+	"errors"
 	"testing"
 
-	lokiv1beta1 "github.com/grafana/loki/operator/api/v1beta1"
-	"github.com/grafana/loki/operator/internal/external/k8s/k8sfakes"
-	"github.com/grafana/loki/operator/internal/status"
-
 	"github.com/stretchr/testify/require"
-
+	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime/schema"
 	"k8s.io/apimachinery/pkg/types"
-	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
+
+	lokiv1 "github.com/grafana/loki/operator/apis/loki/v1"
+	"github.com/grafana/loki/operator/internal/external/k8s/k8sfakes"
 )
 
-func TestSetReadyCondition_WhenGetLokiStackReturnsError_ReturnError(t *testing.T) {
-	k := &k8sfakes.FakeClient{}
-
-	r := ctrl.Request{
-		NamespacedName: types.NamespacedName{
-			Name:      "my-stack",
-			Namespace: "some-ns",
-		},
-	}
-
-	k.GetStub = func(_ context.Context, name types.NamespacedName, object client.Object) error {
-		return apierrors.NewBadRequest("something wasn't found")
-	}
-
-	err := status.SetReadyCondition(context.TODO(), k, r)
-	require.Error(t, err)
-}
-
-func TestSetReadyCondition_WhenGetLokiStackReturnsNotFound_DoNothing(t *testing.T) {
-	k := &k8sfakes.FakeClient{}
-
-	r := ctrl.Request{
-		NamespacedName: types.NamespacedName{
-			Name:      "my-stack",
-			Namespace: "some-ns",
-		},
-	}
-
-	k.GetStub = func(_ context.Context, name types.NamespacedName, object client.Object) error {
-		return apierrors.NewNotFound(schema.GroupResource{}, "something wasn't found")
-	}
-
-	err := status.SetReadyCondition(context.TODO(), k, r)
-	require.NoError(t, err)
-}
-
-func TestSetReadyCondition_WhenExisting_DoNothing(t *testing.T) {
-	k := &k8sfakes.FakeClient{}
-
-	s := lokiv1beta1.LokiStack{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:      "my-stack",
-			Namespace: "some-ns",
-		},
-		Status: lokiv1beta1.LokiStackStatus{
-			Conditions: []metav1.Condition{
-				{
-					Type:   string(lokiv1beta1.ConditionReady),
-					Status: metav1.ConditionTrue,
-				},
-			},
-		},
-	}
-
-	r := ctrl.Request{
-		NamespacedName: types.NamespacedName{
-			Name:      "my-stack",
-			Namespace: "some-ns",
-		},
-	}
-
-	k.GetStub = func(_ context.Context, name types.NamespacedName, object client.Object) error {
-		if r.Name == name.Name && r.Namespace == name.Namespace {
-			k.SetClientObject(object, &s)
-			return nil
-		}
-		return apierrors.NewNotFound(schema.GroupResource{}, "something wasn't found")
-	}
-
-	err := status.SetReadyCondition(context.TODO(), k, r)
-	require.NoError(t, err)
-	require.Zero(t, k.StatusCallCount())
-}
-
-func TestSetReadyCondition_WhenExisting_SetReadyConditionTrue(t *testing.T) {
+func setupFakesNoError(t *testing.T, stack *lokiv1.LokiStack) (*k8sfakes.FakeClient, *k8sfakes.FakeStatusWriter) {
 	sw := &k8sfakes.FakeStatusWriter{}
 	k := &k8sfakes.FakeClient{}
-
-	k.StatusStub = func() client.StatusWriter { return sw }
-
-	s := lokiv1beta1.LokiStack{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:      "my-stack",
-			Namespace: "some-ns",
-		},
-		Status: lokiv1beta1.LokiStackStatus{
-			Conditions: []metav1.Condition{
-				{
-					Type:   string(lokiv1beta1.ConditionReady),
-					Status: metav1.ConditionFalse,
-				},
-			},
-		},
-	}
-
-	r := ctrl.Request{
-		NamespacedName: types.NamespacedName{
-			Name:      "my-stack",
-			Namespace: "some-ns",
-		},
-	}
-
-	k.GetStub = func(_ context.Context, name types.NamespacedName, object client.Object) error {
-		if r.Name == name.Name && r.Namespace == name.Namespace {
-			k.SetClientObject(object, &s)
+	k.GetStub = func(_ context.Context, name types.NamespacedName, object client.Object, _ ...client.GetOption) error {
+		if name.Name == stack.Name && name.Namespace == stack.Namespace {
+			k.SetClientObject(object, stack)
 			return nil
 		}
 		return apierrors.NewNotFound(schema.GroupResource{}, "something wasn't found")
 	}
+	k.StatusStub = func() client.StatusWriter { return sw }
 
-	sw.UpdateStub = func(_ context.Context, obj client.Object, _ ...client.UpdateOption) error {
-		actual := obj.(*lokiv1beta1.LokiStack)
+	sw.UpdateStub = func(_ context.Context, obj client.Object, _ ...client.SubResourceUpdateOption) error {
+		actual := obj.(*lokiv1.LokiStack)
 		require.NotEmpty(t, actual.Status.Conditions)
 		require.Equal(t, metav1.ConditionTrue, actual.Status.Conditions[0].Status)
 		return nil
 	}
 
-	err := status.SetReadyCondition(context.TODO(), k, r)
-	require.NoError(t, err)
-
-	require.NotZero(t, k.StatusCallCount())
-	require.NotZero(t, sw.UpdateCallCount())
+	return k, sw
 }
 
-func TestSetReadyCondition_WhenNoneExisting_AppendReadyCondition(t *testing.T) {
-	sw := &k8sfakes.FakeStatusWriter{}
+func TestGenerateCondition(t *testing.T) {
 	k := &k8sfakes.FakeClient{}
-
-	k.StatusStub = func() client.StatusWriter { return sw }
-
-	s := lokiv1beta1.LokiStack{
+	lokiStack := lokiv1.LokiStack{
+		TypeMeta: metav1.TypeMeta{
+			Kind: "LokiStack",
+		},
 		ObjectMeta: metav1.ObjectMeta{
-			Name:      "my-stack",
-			Namespace: "some-ns",
+			Name:      "test-lokistack",
+			Namespace: "test-ns",
 		},
 	}
-
-	r := ctrl.Request{
-		NamespacedName: types.NamespacedName{
-			Name:      "my-stack",
-			Namespace: "some-ns",
+	tt := []struct {
+		desc            string
+		componentStatus *lokiv1.LokiStackComponentStatus
+		degradedErr     *DegradedError
+		wantCondition   metav1.Condition
+	}{
+		{
+			desc:            "no error",
+			componentStatus: &lokiv1.LokiStackComponentStatus{},
+			wantCondition:   conditionReady,
 		},
-	}
-
-	k.GetStub = func(_ context.Context, name types.NamespacedName, object client.Object) error {
-		if r.Name == name.Name && r.Namespace == name.Namespace {
-			k.SetClientObject(object, &s)
-			return nil
-		}
-		return apierrors.NewNotFound(schema.GroupResource{}, "something wasn't found")
-	}
-
-	sw.UpdateStub = func(_ context.Context, obj client.Object, _ ...client.UpdateOption) error {
-		actual := obj.(*lokiv1beta1.LokiStack)
-		require.NotEmpty(t, actual.Status.Conditions)
-		return nil
-	}
-
-	err := status.SetReadyCondition(context.TODO(), k, r)
-	require.NoError(t, err)
-
-	require.NotZero(t, k.StatusCallCount())
-	require.NotZero(t, sw.UpdateCallCount())
-}
-
-func TestSetFailedCondition_WhenGetLokiStackReturnsError_ReturnError(t *testing.T) {
-	k := &k8sfakes.FakeClient{}
-
-	r := ctrl.Request{
-		NamespacedName: types.NamespacedName{
-			Name:      "my-stack",
-			Namespace: "some-ns",
-		},
-	}
-
-	k.GetStub = func(_ context.Context, name types.NamespacedName, object client.Object) error {
-		return apierrors.NewBadRequest("something wasn't found")
-	}
-
-	err := status.SetFailedCondition(context.TODO(), k, r)
-	require.Error(t, err)
-}
-
-func TestSetFailedCondition_WhenGetLokiStackReturnsNotFound_DoNothing(t *testing.T) {
-	k := &k8sfakes.FakeClient{}
-
-	r := ctrl.Request{
-		NamespacedName: types.NamespacedName{
-			Name:      "my-stack",
-			Namespace: "some-ns",
-		},
-	}
-
-	k.GetStub = func(_ context.Context, name types.NamespacedName, object client.Object) error {
-		return apierrors.NewNotFound(schema.GroupResource{}, "something wasn't found")
-	}
-
-	err := status.SetFailedCondition(context.TODO(), k, r)
-	require.NoError(t, err)
-}
-
-func TestSetFailedCondition_WhenExisting_DoNothing(t *testing.T) {
-	k := &k8sfakes.FakeClient{}
-
-	s := lokiv1beta1.LokiStack{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:      "my-stack",
-			Namespace: "some-ns",
-		},
-		Status: lokiv1beta1.LokiStackStatus{
-			Conditions: []metav1.Condition{
-				{
-					Type:   string(lokiv1beta1.ConditionFailed),
-					Status: metav1.ConditionTrue,
+		{
+			desc: "container pending",
+			componentStatus: &lokiv1.LokiStackComponentStatus{
+				Ingester: lokiv1.PodStatusMap{
+					lokiv1.PodPending: {
+						"pod-0",
+					},
 				},
+			},
+			wantCondition: conditionPending,
+		},
+		{
+			desc: "container failed",
+			componentStatus: &lokiv1.LokiStackComponentStatus{
+				Ingester: lokiv1.PodStatusMap{
+					lokiv1.PodFailed: {
+						"pod-0",
+					},
+				},
+			},
+			wantCondition: conditionFailed,
+		},
+		{
+			desc: "degraded error",
+			componentStatus: &lokiv1.LokiStackComponentStatus{
+				Ingester: lokiv1.PodStatusMap{
+					lokiv1.PodRunning: {
+						"pod-0",
+					},
+				},
+			},
+			degradedErr: &DegradedError{
+				Message: "test-message",
+				Reason:  "test-reason",
+			},
+			wantCondition: metav1.Condition{
+				Type:    "Degraded",
+				Reason:  "test-reason",
+				Message: "test-message",
 			},
 		},
 	}
 
-	r := ctrl.Request{
-		NamespacedName: types.NamespacedName{
-			Name:      "my-stack",
-			Namespace: "some-ns",
-		},
-	}
+	for _, tc := range tt {
+		tc := tc
+		t.Run(tc.desc, func(t *testing.T) {
+			t.Parallel()
 
-	k.GetStub = func(_ context.Context, name types.NamespacedName, object client.Object) error {
-		if r.Name == name.Name && r.Namespace == name.Namespace {
-			k.SetClientObject(object, &s)
-			return nil
-		}
-		return apierrors.NewNotFound(schema.GroupResource{}, "something wasn't found")
+			condition, err := generateCondition(context.TODO(), tc.componentStatus, k, &lokiStack, tc.degradedErr)
+			require.Nil(t, err)
+			require.Equal(t, tc.wantCondition, condition)
+		})
 	}
-
-	err := status.SetFailedCondition(context.TODO(), k, r)
-	require.NoError(t, err)
-	require.Zero(t, k.StatusCallCount())
 }
 
-func TestSetFailedCondition_WhenExisting_SetFailedConditionTrue(t *testing.T) {
-	sw := &k8sfakes.FakeStatusWriter{}
-	k := &k8sfakes.FakeClient{}
-
-	k.StatusStub = func() client.StatusWriter { return sw }
-
-	s := lokiv1beta1.LokiStack{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:      "my-stack",
-			Namespace: "some-ns",
+func TestGenerateCondition_ZoneAwareLokiStack(t *testing.T) {
+	testError := errors.New("test-error") //nolint:goerr113
+	tt := []struct {
+		desc          string
+		nodes         []corev1.Node
+		wantCondition metav1.Condition
+		wantErr       error
+	}{
+		{
+			desc: "nodes available",
+			nodes: []corev1.Node{
+				{ObjectMeta: metav1.ObjectMeta{
+					Labels: map[string]string{"topology-key": "value"},
+				}},
+			},
+			wantCondition: conditionPending,
 		},
-		Status: lokiv1beta1.LokiStackStatus{
-			Conditions: []metav1.Condition{
+		{
+			desc: "nodes available but empty label value",
+			nodes: []corev1.Node{
+				{ObjectMeta: metav1.ObjectMeta{
+					Labels: map[string]string{"topology-key": ""},
+				}},
+			},
+			wantCondition: conditionDegradedEmptyNodeLabel,
+		},
+		{
+			desc:          "no nodes available",
+			nodes:         []corev1.Node{},
+			wantCondition: conditionDegradedNodeLabels,
+		},
+		{
+			desc:    "api error",
+			nodes:   []corev1.Node{},
+			wantErr: testError,
+		},
+	}
+
+	for _, tc := range tt {
+		tc := tc
+		t.Run(tc.desc, func(t *testing.T) {
+			t.Parallel()
+
+			componentStatus := &lokiv1.LokiStackComponentStatus{
+				Ingester: lokiv1.PodStatusMap{
+					lokiv1.PodPending: {
+						"pod-0",
+					},
+				},
+			}
+			lokiStack := lokiv1.LokiStack{
+				Spec: lokiv1.LokiStackSpec{
+					Replication: &lokiv1.ReplicationSpec{
+						Zones: []lokiv1.ZoneSpec{
+							{
+								TopologyKey: "topology-key",
+							},
+						},
+					},
+				},
+				ObjectMeta: metav1.ObjectMeta{
+					Name:      "test-lokistack",
+					Namespace: "test-ns",
+				},
+				TypeMeta: metav1.TypeMeta{
+					Kind: "LokiStack",
+				},
+			}
+
+			k, _ := setupFakesNoError(t, &lokiStack)
+			k.ListStub = func(_ context.Context, ol client.ObjectList, options ...client.ListOption) error {
+				for _, o := range options {
+					if labels, ok := o.(client.HasLabels); ok {
+						require.Len(t, labels, 1)
+						require.Equal(t, "topology-key", labels[0])
+					}
+				}
+
+				k.SetClientObjectList(ol, &corev1.NodeList{
+					Items: tc.nodes,
+				})
+				return tc.wantErr
+			}
+
+			condition, err := generateCondition(context.TODO(), componentStatus, k, &lokiStack, nil)
+
+			require.Equal(t, tc.wantErr, err)
+			require.Equal(t, tc.wantCondition, condition)
+		})
+	}
+}
+
+func TestGenerateWarningCondition_WhenStorageSchemaIsOld(t *testing.T) {
+	tt := []struct {
+		desc          string
+		schemas       []lokiv1.ObjectStorageSchema
+		wantCondition []metav1.Condition
+	}{
+		{
+			desc: "no V13 in schema config",
+			schemas: []lokiv1.ObjectStorageSchema{
 				{
-					Type:   string(lokiv1beta1.ConditionFailed),
-					Status: metav1.ConditionFalse,
+					Version:       lokiv1.ObjectStorageSchemaV11,
+					EffectiveDate: "2020-10-11",
+				},
+				{
+					Version:       lokiv1.ObjectStorageSchemaV12,
+					EffectiveDate: "2023-10-11",
 				},
 			},
+			wantCondition: []metav1.Condition{{
+				Type:    string(lokiv1.ConditionWarning),
+				Reason:  string(lokiv1.ReasonStorageNeedsSchemaUpdate),
+				Message: messageWarningNeedsSchemaVersionUpdate,
+			}},
 		},
-	}
-
-	r := ctrl.Request{
-		NamespacedName: types.NamespacedName{
-			Name:      "my-stack",
-			Namespace: "some-ns",
-		},
-	}
-
-	k.GetStub = func(_ context.Context, name types.NamespacedName, object client.Object) error {
-		if r.Name == name.Name && r.Namespace == name.Namespace {
-			k.SetClientObject(object, &s)
-			return nil
-		}
-		return apierrors.NewNotFound(schema.GroupResource{}, "something wasn't found")
-	}
-
-	sw.UpdateStub = func(_ context.Context, obj client.Object, _ ...client.UpdateOption) error {
-		actual := obj.(*lokiv1beta1.LokiStack)
-		require.NotEmpty(t, actual.Status.Conditions)
-		require.Equal(t, metav1.ConditionTrue, actual.Status.Conditions[0].Status)
-		return nil
-	}
-
-	err := status.SetFailedCondition(context.TODO(), k, r)
-	require.NoError(t, err)
-
-	require.NotZero(t, k.StatusCallCount())
-	require.NotZero(t, sw.UpdateCallCount())
-}
-
-func TestSetFailedCondition_WhenNoneExisting_AppendFailedCondition(t *testing.T) {
-	sw := &k8sfakes.FakeStatusWriter{}
-	k := &k8sfakes.FakeClient{}
-
-	k.StatusStub = func() client.StatusWriter { return sw }
-
-	s := lokiv1beta1.LokiStack{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:      "my-stack",
-			Namespace: "some-ns",
-		},
-	}
-
-	r := ctrl.Request{
-		NamespacedName: types.NamespacedName{
-			Name:      "my-stack",
-			Namespace: "some-ns",
-		},
-	}
-
-	k.GetStub = func(_ context.Context, name types.NamespacedName, object client.Object) error {
-		if r.Name == name.Name && r.Namespace == name.Namespace {
-			k.SetClientObject(object, &s)
-			return nil
-		}
-		return apierrors.NewNotFound(schema.GroupResource{}, "something wasn't found")
-	}
-
-	sw.UpdateStub = func(_ context.Context, obj client.Object, _ ...client.UpdateOption) error {
-		actual := obj.(*lokiv1beta1.LokiStack)
-		require.NotEmpty(t, actual.Status.Conditions)
-		return nil
-	}
-
-	err := status.SetFailedCondition(context.TODO(), k, r)
-	require.NoError(t, err)
-
-	require.NotZero(t, k.StatusCallCount())
-	require.NotZero(t, sw.UpdateCallCount())
-}
-
-func TestSetDegradedCondition_WhenGetLokiStackReturnsError_ReturnError(t *testing.T) {
-	k := &k8sfakes.FakeClient{}
-
-	msg := "tell me nothing"
-	reason := lokiv1beta1.ReasonMissingObjectStorageSecret
-
-	r := ctrl.Request{
-		NamespacedName: types.NamespacedName{
-			Name:      "my-stack",
-			Namespace: "some-ns",
-		},
-	}
-
-	k.GetStub = func(_ context.Context, name types.NamespacedName, object client.Object) error {
-		return apierrors.NewBadRequest("something wasn't found")
-	}
-
-	err := status.SetDegradedCondition(context.TODO(), k, r, msg, reason)
-	require.Error(t, err)
-}
-
-func TestSetPendingCondition_WhenGetLokiStackReturnsError_ReturnError(t *testing.T) {
-	k := &k8sfakes.FakeClient{}
-
-	r := ctrl.Request{
-		NamespacedName: types.NamespacedName{
-			Name:      "my-stack",
-			Namespace: "some-ns",
-		},
-	}
-
-	k.GetStub = func(_ context.Context, name types.NamespacedName, object client.Object) error {
-		return apierrors.NewBadRequest("something wasn't found")
-	}
-
-	err := status.SetPendingCondition(context.TODO(), k, r)
-	require.Error(t, err)
-}
-
-func TestSetPendingCondition_WhenGetLokiStackReturnsNotFound_DoNothing(t *testing.T) {
-	k := &k8sfakes.FakeClient{}
-
-	r := ctrl.Request{
-		NamespacedName: types.NamespacedName{
-			Name:      "my-stack",
-			Namespace: "some-ns",
-		},
-	}
-
-	k.GetStub = func(_ context.Context, name types.NamespacedName, object client.Object) error {
-		return apierrors.NewNotFound(schema.GroupResource{}, "something wasn't found")
-	}
-
-	err := status.SetPendingCondition(context.TODO(), k, r)
-	require.NoError(t, err)
-}
-
-func TestSetPendingCondition_WhenExisting_DoNothing(t *testing.T) {
-	k := &k8sfakes.FakeClient{}
-
-	s := lokiv1beta1.LokiStack{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:      "my-stack",
-			Namespace: "some-ns",
-		},
-		Status: lokiv1beta1.LokiStackStatus{
-			Conditions: []metav1.Condition{
+		{
+			desc: "with V13 not as the last element in schema config",
+			schemas: []lokiv1.ObjectStorageSchema{
 				{
-					Type:   string(lokiv1beta1.ConditionPending),
-					Status: metav1.ConditionTrue,
+					Version:       lokiv1.ObjectStorageSchemaV11,
+					EffectiveDate: "2020-10-11",
+				},
+				{
+					Version:       lokiv1.ObjectStorageSchemaV13,
+					EffectiveDate: "2023-10-11",
+				},
+				{
+					Version:       lokiv1.ObjectStorageSchemaV12,
+					EffectiveDate: "2024-10-11",
 				},
 			},
+			wantCondition: []metav1.Condition{{
+				Type:    string(lokiv1.ConditionWarning),
+				Reason:  string(lokiv1.ReasonStorageNeedsSchemaUpdate),
+				Message: messageWarningNeedsSchemaVersionUpdate,
+			}},
 		},
-	}
-
-	r := ctrl.Request{
-		NamespacedName: types.NamespacedName{
-			Name:      "my-stack",
-			Namespace: "some-ns",
-		},
-	}
-
-	k.GetStub = func(_ context.Context, name types.NamespacedName, object client.Object) error {
-		if r.Name == name.Name && r.Namespace == name.Namespace {
-			k.SetClientObject(object, &s)
-			return nil
-		}
-		return apierrors.NewNotFound(schema.GroupResource{}, "something wasn't found")
-	}
-
-	err := status.SetPendingCondition(context.TODO(), k, r)
-	require.NoError(t, err)
-	require.Zero(t, k.StatusCallCount())
-}
-
-func TestSetPendingCondition_WhenExisting_SetPendingConditionTrue(t *testing.T) {
-	sw := &k8sfakes.FakeStatusWriter{}
-	k := &k8sfakes.FakeClient{}
-
-	k.StatusStub = func() client.StatusWriter { return sw }
-
-	s := lokiv1beta1.LokiStack{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:      "my-stack",
-			Namespace: "some-ns",
-		},
-		Status: lokiv1beta1.LokiStackStatus{
-			Conditions: []metav1.Condition{
+		{
+			desc: "with V13 as the last element in schema config",
+			schemas: []lokiv1.ObjectStorageSchema{
 				{
-					Type:   string(lokiv1beta1.ConditionPending),
-					Status: metav1.ConditionFalse,
+					Version:       lokiv1.ObjectStorageSchemaV11,
+					EffectiveDate: "2020-10-11",
+				},
+				{
+					Version:       lokiv1.ObjectStorageSchemaV12,
+					EffectiveDate: "2023-10-11",
+				},
+				{
+					Version:       lokiv1.ObjectStorageSchemaV13,
+					EffectiveDate: "2024-10-11",
 				},
 			},
+			wantCondition: []metav1.Condition{},
 		},
 	}
-
-	r := ctrl.Request{
-		NamespacedName: types.NamespacedName{
-			Name:      "my-stack",
-			Namespace: "some-ns",
-		},
+	for _, tc := range tt {
+		tc := tc
+		t.Run(tc.desc, func(t *testing.T) {
+			t.Parallel()
+			condition := generateWarnings(tc.schemas)
+			require.Equal(t, condition, tc.wantCondition)
+		})
 	}
-
-	k.GetStub = func(_ context.Context, name types.NamespacedName, object client.Object) error {
-		if r.Name == name.Name && r.Namespace == name.Namespace {
-			k.SetClientObject(object, &s)
-			return nil
-		}
-		return apierrors.NewNotFound(schema.GroupResource{}, "something wasn't found")
-	}
-
-	sw.UpdateStub = func(_ context.Context, obj client.Object, _ ...client.UpdateOption) error {
-		actual := obj.(*lokiv1beta1.LokiStack)
-		require.NotEmpty(t, actual.Status.Conditions)
-		require.Equal(t, metav1.ConditionTrue, actual.Status.Conditions[0].Status)
-		return nil
-	}
-
-	err := status.SetPendingCondition(context.TODO(), k, r)
-	require.NoError(t, err)
-	require.NotZero(t, k.StatusCallCount())
-	require.NotZero(t, sw.UpdateCallCount())
-}
-
-func TestSetPendingCondition_WhenNoneExisting_AppendPendingCondition(t *testing.T) {
-	sw := &k8sfakes.FakeStatusWriter{}
-	k := &k8sfakes.FakeClient{}
-
-	k.StatusStub = func() client.StatusWriter { return sw }
-
-	s := lokiv1beta1.LokiStack{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:      "my-stack",
-			Namespace: "some-ns",
-		},
-	}
-
-	r := ctrl.Request{
-		NamespacedName: types.NamespacedName{
-			Name:      "my-stack",
-			Namespace: "some-ns",
-		},
-	}
-
-	k.GetStub = func(_ context.Context, name types.NamespacedName, object client.Object) error {
-		if r.Name == name.Name && r.Namespace == name.Namespace {
-			k.SetClientObject(object, &s)
-			return nil
-		}
-		return apierrors.NewNotFound(schema.GroupResource{}, "something wasn't found")
-	}
-
-	sw.UpdateStub = func(_ context.Context, obj client.Object, _ ...client.UpdateOption) error {
-		actual := obj.(*lokiv1beta1.LokiStack)
-		require.NotEmpty(t, actual.Status.Conditions)
-		return nil
-	}
-
-	err := status.SetPendingCondition(context.TODO(), k, r)
-	require.NoError(t, err)
-
-	require.NotZero(t, k.StatusCallCount())
-	require.NotZero(t, sw.UpdateCallCount())
-}
-
-func TestSetDegradedCondition_WhenGetLokiStackReturnsNotFound_DoNothing(t *testing.T) {
-	k := &k8sfakes.FakeClient{}
-
-	msg := "tell me nothing"
-	reason := lokiv1beta1.ReasonMissingObjectStorageSecret
-
-	r := ctrl.Request{
-		NamespacedName: types.NamespacedName{
-			Name:      "my-stack",
-			Namespace: "some-ns",
-		},
-	}
-
-	k.GetStub = func(_ context.Context, name types.NamespacedName, object client.Object) error {
-		return apierrors.NewNotFound(schema.GroupResource{}, "something wasn't found")
-	}
-
-	err := status.SetDegradedCondition(context.TODO(), k, r, msg, reason)
-	require.NoError(t, err)
-}
-
-func TestSetDegradedCondition_WhenExisting_DoNothing(t *testing.T) {
-	k := &k8sfakes.FakeClient{}
-
-	msg := "tell me nothing"
-	reason := lokiv1beta1.ReasonMissingObjectStorageSecret
-	s := lokiv1beta1.LokiStack{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:      "my-stack",
-			Namespace: "some-ns",
-		},
-		Status: lokiv1beta1.LokiStackStatus{
-			Conditions: []metav1.Condition{
-				{
-					Type:   string(lokiv1beta1.ConditionDegraded),
-					Reason: string(reason),
-					Status: metav1.ConditionTrue,
-				},
-			},
-		},
-	}
-
-	r := ctrl.Request{
-		NamespacedName: types.NamespacedName{
-			Name:      "my-stack",
-			Namespace: "some-ns",
-		},
-	}
-
-	k.GetStub = func(_ context.Context, name types.NamespacedName, object client.Object) error {
-		if r.Name == name.Name && r.Namespace == name.Namespace {
-			k.SetClientObject(object, &s)
-			return nil
-		}
-		return apierrors.NewNotFound(schema.GroupResource{}, "something wasn't found")
-	}
-
-	err := status.SetDegradedCondition(context.TODO(), k, r, msg, reason)
-	require.NoError(t, err)
-	require.Zero(t, k.StatusCallCount())
-}
-
-func TestSetDegradedCondition_WhenExisting_SetDegradedConditionTrue(t *testing.T) {
-	sw := &k8sfakes.FakeStatusWriter{}
-	k := &k8sfakes.FakeClient{}
-
-	k.StatusStub = func() client.StatusWriter { return sw }
-
-	msg := "tell me something"
-	reason := lokiv1beta1.ReasonMissingObjectStorageSecret
-	s := lokiv1beta1.LokiStack{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:      "my-stack",
-			Namespace: "some-ns",
-		},
-		Status: lokiv1beta1.LokiStackStatus{
-			Conditions: []metav1.Condition{
-				{
-					Type:   string(lokiv1beta1.ConditionDegraded),
-					Reason: string(reason),
-					Status: metav1.ConditionFalse,
-				},
-			},
-		},
-	}
-
-	r := ctrl.Request{
-		NamespacedName: types.NamespacedName{
-			Name:      "my-stack",
-			Namespace: "some-ns",
-		},
-	}
-
-	k.GetStub = func(_ context.Context, name types.NamespacedName, object client.Object) error {
-		if r.Name == name.Name && r.Namespace == name.Namespace {
-			k.SetClientObject(object, &s)
-			return nil
-		}
-		return apierrors.NewNotFound(schema.GroupResource{}, "something wasn't found")
-	}
-
-	sw.UpdateStub = func(_ context.Context, obj client.Object, _ ...client.UpdateOption) error {
-		actual := obj.(*lokiv1beta1.LokiStack)
-		require.NotEmpty(t, actual.Status.Conditions)
-		require.Equal(t, metav1.ConditionTrue, actual.Status.Conditions[0].Status)
-		return nil
-	}
-
-	err := status.SetDegradedCondition(context.TODO(), k, r, msg, reason)
-	require.NoError(t, err)
-	require.NotZero(t, k.StatusCallCount())
-	require.NotZero(t, sw.UpdateCallCount())
-}
-
-func TestSetDegradedCondition_WhenNoneExisting_AppendDegradedCondition(t *testing.T) {
-	sw := &k8sfakes.FakeStatusWriter{}
-	k := &k8sfakes.FakeClient{}
-
-	k.StatusStub = func() client.StatusWriter { return sw }
-
-	msg := "tell me something"
-	reason := lokiv1beta1.ReasonMissingObjectStorageSecret
-	s := lokiv1beta1.LokiStack{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:      "my-stack",
-			Namespace: "some-ns",
-		},
-	}
-
-	r := ctrl.Request{
-		NamespacedName: types.NamespacedName{
-			Name:      "my-stack",
-			Namespace: "some-ns",
-		},
-	}
-
-	k.GetStub = func(_ context.Context, name types.NamespacedName, object client.Object) error {
-		if r.Name == name.Name && r.Namespace == name.Namespace {
-			k.SetClientObject(object, &s)
-			return nil
-		}
-		return apierrors.NewNotFound(schema.GroupResource{}, "something wasn't found")
-	}
-
-	sw.UpdateStub = func(_ context.Context, obj client.Object, _ ...client.UpdateOption) error {
-		actual := obj.(*lokiv1beta1.LokiStack)
-		require.NotEmpty(t, actual.Status.Conditions)
-		return nil
-	}
-
-	err := status.SetDegradedCondition(context.TODO(), k, r, msg, reason)
-	require.NoError(t, err)
-
-	require.NotZero(t, k.StatusCallCount())
-	require.NotZero(t, sw.UpdateCallCount())
 }

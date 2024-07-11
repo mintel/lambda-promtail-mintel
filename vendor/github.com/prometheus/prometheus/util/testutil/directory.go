@@ -16,7 +16,6 @@ package testutil
 import (
 	"crypto/sha256"
 	"io"
-	"io/ioutil"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -34,7 +33,7 @@ const (
 	// NilCloser is a no-op Closer.
 	NilCloser = nilCloser(true)
 
-	// The number of times that a TemporaryDirectory will retry its removal
+	// The number of times that a TemporaryDirectory will retry its removal.
 	temporaryDirectoryRemoveRetries = 2
 )
 
@@ -120,7 +119,7 @@ func NewTemporaryDirectory(name string, t T) (handler TemporaryDirectory) {
 		err       error
 	)
 
-	directory, err = ioutil.TempDir(defaultDirectory, name)
+	directory, err = os.MkdirTemp(defaultDirectory, name)
 	require.NoError(t, err)
 
 	handler = temporaryDirectory{

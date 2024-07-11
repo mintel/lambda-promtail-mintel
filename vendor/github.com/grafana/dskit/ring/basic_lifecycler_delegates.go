@@ -83,6 +83,7 @@ func (d *TokensPersistencyDelegate) OnRingInstanceRegister(lifecycler *BasicLife
 	// case the instance exist in the ring (which is OK because the lifecycler
 	// will correctly reconcile this case too).
 	return d.next.OnRingInstanceRegister(lifecycler, ringDesc, true, lifecycler.GetInstanceID(), InstanceDesc{
+		Id:                  lifecycler.GetInstanceID(),
 		Addr:                lifecycler.GetInstanceAddr(),
 		Timestamp:           time.Now().Unix(),
 		RegisteredTimestamp: lifecycler.GetRegisteredAt().Unix(),
@@ -150,3 +151,38 @@ func (d *AutoForgetDelegate) OnRingInstanceHeartbeat(lifecycler *BasicLifecycler
 
 	d.next.OnRingInstanceHeartbeat(lifecycler, ringDesc, instanceDesc)
 }
+
+// InstanceRegisterDelegate generates a new set of tokenCount tokens on instance register, and returns the registerState InstanceState.
+type InstanceRegisterDelegate struct {
+	registerState InstanceState
+	tokenCount    int
+}
+
+func NewInstanceRegisterDelegate(state InstanceState, tokenCount int) InstanceRegisterDelegate {
+	return InstanceRegisterDelegate{
+		registerState: state,
+		tokenCount:    tokenCount,
+	}
+}
+
+func (d InstanceRegisterDelegate) OnRingInstanceRegister(l *BasicLifecycler, ringDesc Desc, instanceExists bool, _ string, instanceDesc InstanceDesc) (InstanceState, Tokens) {
+	// Keep the existing tokens if any, otherwise start with a clean situation.
+	var tokens []uint32
+	if instanceExists {
+		tokens = instanceDesc.GetTokens()
+	}
+
+	takenTokens := ringDesc.GetTokens()
+	newTokens := l.GetTokenGenerator().GenerateTokens(d.tokenCount-len(tokens), takenTokens)
+
+	// Tokens sorting will be enforced by the parent caller.
+	tokens = append(tokens, newTokens...)
+
+	return d.registerState, tokens
+}
+
+func (d InstanceRegisterDelegate) OnRingInstanceTokens(*BasicLifecycler, Tokens) {}
+
+func (d InstanceRegisterDelegate) OnRingInstanceStopping(*BasicLifecycler) {}
+
+func (d InstanceRegisterDelegate) OnRingInstanceHeartbeat(*BasicLifecycler, *Desc, *InstanceDesc) {}

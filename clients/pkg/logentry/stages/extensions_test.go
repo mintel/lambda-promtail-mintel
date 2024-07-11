@@ -5,9 +5,11 @@ import (
 	"time"
 
 	"github.com/prometheus/client_golang/prometheus"
+	"github.com/prometheus/common/model"
 	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
 
-	util_log "github.com/grafana/loki/pkg/util/log"
+	util_log "github.com/grafana/loki/v3/pkg/util/log"
 )
 
 var (
@@ -87,6 +89,135 @@ var (
 	criTestTime2   = time.Now()
 )
 
+type testEntry struct {
+	labels model.LabelSet
+	line   string
+}
+
+func TestCRI_tags(t *testing.T) {
+	cases := []struct {
+		name                       string
+		lines                      []string
+		expected                   []string
+		maxPartialLines            int
+		maxPartialLineSize         int
+		maxPartialLineSizeTruncate bool
+		entries                    []testEntry
+		err                        error
+	}{
+		{
+			name: "tag F",
+			entries: []testEntry{
+				{line: "2019-05-07T18:57:50.904275087+00:00 stdout F some full line", labels: model.LabelSet{"foo": "bar"}},
+				{line: "2019-05-07T18:57:55.904275087+00:00 stdout F log", labels: model.LabelSet{"foo": "bar"}},
+			},
+			expected: []string{"some full line", "log"},
+		},
+		{
+			name: "tag P multi-stream",
+			entries: []testEntry{
+				{line: "2019-05-07T18:57:50.904275087+00:00 stdout P partial line 1 ", labels: model.LabelSet{"foo": "bar"}},
+				{line: "2019-05-07T18:57:50.904275087+00:00 stdout P partial line 2 ", labels: model.LabelSet{"foo": "bar2"}},
+				{line: "2019-05-07T18:57:55.904275087+00:00 stdout F log finished", labels: model.LabelSet{"foo": "bar"}},
+				{line: "2019-05-07T18:57:55.904275087+00:00 stdout F another full log", labels: model.LabelSet{"foo": "bar2"}},
+			},
+			expected: []string{
+				"partial line 1 log finished",     // belongs to stream `{foo="bar"}`
+				"partial line 2 another full log", // belongs to stream `{foo="bar2"}
+			},
+		},
+		{
+			name: "tag P multi-stream with maxPartialLines exceeded",
+			entries: []testEntry{
+				{line: "2019-05-07T18:57:50.904275087+00:00 stdout P partial line 1 ", labels: model.LabelSet{"label1": "val1", "label2": "val2"}},
+
+				{line: "2019-05-07T18:57:50.904275087+00:00 stdout P partial line 2 ", labels: model.LabelSet{"label1": "val1"}},
+				{line: "2019-05-07T18:57:50.904275087+00:00 stdout P partial line 3 ", labels: model.LabelSet{"label1": "val1", "label2": "val2"}},
+				{line: "2019-05-07T18:57:50.904275087+00:00 stdout P partial line 4 ", labels: model.LabelSet{"label1": "val3"}},
+				{line: "2019-05-07T18:57:50.904275087+00:00 stdout P partial line 5 ", labels: model.LabelSet{"label1": "val4"}}, // exceeded maxPartialLines as already 3 streams in flight.
+				{line: "2019-05-07T18:57:55.904275087+00:00 stdout F log finished", labels: model.LabelSet{"label1": "val1", "label2": "val2"}},
+				{line: "2019-05-07T18:57:55.904275087+00:00 stdout F another full log", labels: model.LabelSet{"label1": "val3"}},
+				{line: "2019-05-07T18:57:55.904275087+00:00 stdout F yet an another full log", labels: model.LabelSet{"label1": "val4"}},
+			},
+			maxPartialLines: 3,
+			expected: []string{
+				"partial line 1 partial line 3 ",
+				"partial line 2 ",
+				"partial line 4 ",
+				"log finished",
+				"another full log",
+				"partial line 5 yet an another full log",
+			},
+		},
+		{
+			name: "tag P single stream",
+			entries: []testEntry{
+				{line: "2019-05-07T18:57:50.904275087+00:00 stdout P partial line 1 ", labels: model.LabelSet{"foo": "bar"}},
+				{line: "2019-05-07T18:57:50.904275087+00:00 stdout P partial line 2 ", labels: model.LabelSet{"foo": "bar"}},
+				{line: "2019-05-07T18:57:50.904275087+00:00 stdout P partial line 3 ", labels: model.LabelSet{"foo": "bar"}},
+				{line: "2019-05-07T18:57:50.904275087+00:00 stdout P partial line 4 ", labels: model.LabelSet{"foo": "bar"}}, // this exceeds the `MaxPartialLinesSize` of 3
+				{line: "2019-05-07T18:57:55.904275087+00:00 stdout F log finished", labels: model.LabelSet{"foo": "bar"}},
+				{line: "2019-05-07T18:57:55.904275087+00:00 stdout F another full log", labels: model.LabelSet{"foo": "bar"}},
+			},
+			maxPartialLines: 3,
+			expected: []string{
+				"partial line 1 partial line 2 partial line 3 partial line 4 log finished",
+				"another full log",
+			},
+		},
+		{
+			name: "tag P multi-stream with truncation",
+			entries: []testEntry{
+				{line: "2019-05-07T18:57:50.904275087+00:00 stdout P partial line 1 ", labels: model.LabelSet{"foo": "bar"}},
+				{line: "2019-05-07T18:57:50.904275087+00:00 stdout P partial", labels: model.LabelSet{"foo": "bar2"}},
+				{line: "2019-05-07T18:57:55.904275087+00:00 stdout F log finished", labels: model.LabelSet{"foo": "bar"}},
+				{line: "2019-05-07T18:57:55.904275087+00:00 stdout F full", labels: model.LabelSet{"foo": "bar2"}},
+			},
+			maxPartialLineSizeTruncate: true,
+			maxPartialLineSize:         11,
+			expected: []string{
+				"partial lin",
+				"partialfull",
+			},
+		},
+	}
+
+	for _, tt := range cases {
+		t.Run(tt.name, func(t *testing.T) {
+			cfg := map[string]interface{}{
+				"max_partial_lines":              tt.maxPartialLines,
+				"max_partial_line_size":          tt.maxPartialLineSize,
+				"max_partial_line_size_truncate": tt.maxPartialLineSizeTruncate,
+			}
+			p, err := NewCRI(util_log.Logger, cfg, prometheus.DefaultRegisterer)
+			require.NoError(t, err)
+
+			got := make([]string, 0)
+
+			for _, entry := range tt.entries {
+				out := processEntries(p, newEntry(nil, entry.labels, entry.line, time.Now()))
+				if len(out) > 0 {
+					for _, en := range out {
+						got = append(got, en.Line)
+					}
+				}
+			}
+
+			expectedMap := make(map[string]bool)
+			for _, v := range tt.expected {
+				expectedMap[v] = true
+			}
+
+			gotMap := make(map[string]bool)
+			for _, v := range got {
+				gotMap[v] = true
+			}
+
+			assert.Equal(t, expectedMap, gotMap)
+		})
+	}
+}
+
 func TestNewCri(t *testing.T) {
 	tests := map[string]struct {
 		entry          string
@@ -97,7 +228,7 @@ func TestNewCri(t *testing.T) {
 		expectedLabels map[string]string
 	}{
 		"happy path": {
-			criTestTimeStr + " stderr P message",
+			criTestTimeStr + " stderr F message",
 			"message",
 			time.Now(),
 			criTestTime,
@@ -107,7 +238,7 @@ func TestNewCri(t *testing.T) {
 			},
 		},
 		"multi line pass": {
-			criTestTimeStr + " stderr P message\nmessage2",
+			criTestTimeStr + " stderr F message\nmessage2",
 			"message\nmessage2",
 			time.Now(),
 			criTestTime,
@@ -117,7 +248,7 @@ func TestNewCri(t *testing.T) {
 			},
 		},
 		"invalid timestamp": {
-			"3242 stderr P message",
+			"3242 stderr F message",
 			"message",
 			criTestTime2,
 			criTestTime2,
@@ -140,7 +271,8 @@ func TestNewCri(t *testing.T) {
 		tt := tt
 		t.Run(tName, func(t *testing.T) {
 			t.Parallel()
-			p, err := NewCRI(util_log.Logger, prometheus.DefaultRegisterer)
+			cfg := map[string]interface{}{}
+			p, err := NewCRI(util_log.Logger, cfg, prometheus.DefaultRegisterer)
 			if err != nil {
 				t.Fatalf("failed to create CRI parser: %s", err)
 			}
