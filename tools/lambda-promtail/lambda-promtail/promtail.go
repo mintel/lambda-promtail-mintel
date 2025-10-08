@@ -144,6 +144,11 @@ func (b *batch) resetBatch() {
 }
 
 func (c *promtailClient) sendToPromtail(ctx context.Context, b *batch) error {
+	if b.size == 0 {
+		// Loki will reject empty batches with HTTP 422.
+		return nil
+	}
+
 	buf, _, err := b.encode()
 	if err != nil {
 		return err
