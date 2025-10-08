@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"net/http/httputil"
 	"sort"
 	"strings"
 	"time"
@@ -204,6 +205,23 @@ func (c *promtailClient) send(ctx context.Context, buf []byte) (int, error) {
 	}
 	defer resp.Body.Close()
 	if resp.StatusCode/100 != 2 {
+		if resp.StatusCode != 429 && resp.StatusCode != 5 {
+			req := req.Clone(context.TODO())
+			req.Header["Authorization"] = []string{"REDACTED"}
+			req.Body = io.NopCloser(bytes.NewReader(buf))
+			reqBytes, dumpErr := httputil.DumpRequestOut(req, true)
+			if dumpErr == nil {
+				level.Error(*c.log).Log(
+					"msg", "error sending batch",
+					"status", resp.StatusCode,
+					"err", err,
+					"request", string(reqBytes),
+				)
+			} else {
+				level.Error(*c.log).Log("err", dumpErr)
+			}
+		}
+
 		scanner := bufio.NewScanner(io.LimitReader(resp.Body, maxErrMsgLen))
 		line := ""
 		if scanner.Scan() {
