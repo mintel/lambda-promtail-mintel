@@ -278,6 +278,10 @@ func handler(ctx context.Context, ev map[string]interface{}) error {
 		level.Error(*pClient.log).Log("err", fmt.Errorf("invalid event: %s\n", ev))
 		return err
 	}
+	level.Debug(*pClient.log).Log(
+		"eventType", fmt.Sprintf("%T", ev),
+		"event", ev,
+	)
 
 	switch evt := event.(type) {
 	case *events.CloudWatchEvent:
