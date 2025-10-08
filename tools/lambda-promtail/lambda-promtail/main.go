@@ -11,6 +11,7 @@ import (
 	"strings"
 	"time"
 
+	goKitLog "github.com/go-kit/log"
 	"github.com/go-kit/log/level"
 	"github.com/grafana/dskit/backoff"
 	ttlcache "github.com/jellydator/ttlcache/v3"
@@ -273,15 +274,22 @@ func handler(ctx context.Context, ev map[string]interface{}) error {
 		},
 	}, log)
 
+	level.Debug(*pClient.log).Log(
+		"event", goKitLog.Valuer(func() interface{} {
+			b, err := json.Marshal(ev)
+			if err != nil {
+				level.Error(*pClient.log).Log("err", fmt.Errorf("error marshaling event for log: %w", err))
+				return ""
+			}
+			return string(b)
+		}),
+	)
+
 	event, err := checkEventType(ev)
 	if err != nil {
 		level.Error(*pClient.log).Log("err", fmt.Errorf("invalid event: %s\n", ev))
 		return err
 	}
-	level.Debug(*pClient.log).Log(
-		"eventType", fmt.Sprintf("%T", ev),
-		"event", ev,
-	)
 
 	switch evt := event.(type) {
 	case *events.CloudWatchEvent:
