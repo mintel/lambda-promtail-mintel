@@ -11,7 +11,6 @@ import (
 	"strings"
 	"time"
 
-	goKitLog "github.com/go-kit/log"
 	"github.com/go-kit/log/level"
 	"github.com/grafana/dskit/backoff"
 	ttlcache "github.com/jellydator/ttlcache/v3"
@@ -274,16 +273,14 @@ func handler(ctx context.Context, ev map[string]interface{}) error {
 		},
 	}, log)
 
-	level.Debug(*pClient.log).Log(
-		"event", goKitLog.Valuer(func() interface{} {
-			b, err := json.Marshal(ev)
-			if err != nil {
-				level.Error(*pClient.log).Log("err", fmt.Errorf("error marshaling event for log: %w", err))
-				return ""
-			}
-			return string(b)
-		}),
-	)
+	if lvl == "debug" {
+		b, err := json.Marshal(ev)
+		if err != nil {
+			level.Error(*pClient.log).Log("err", fmt.Errorf("error marshaling event for debug log: %w", err))
+		} else {
+			level.Debug(*pClient.log).Log("event", string(b))
+		}
+	}
 
 	event, err := checkEventType(ev)
 	if err != nil {
