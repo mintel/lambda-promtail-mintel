@@ -399,8 +399,8 @@ func parseS3Log(ctx context.Context, b *batch, labels map[string]string, obj io.
 				}}); err != nil {
 					return err
 				}
-				return nil
 			}
+			continue // Done processing this ALB line (either added or filtered)
 		}
 
 		if err := b.add(ctx, entry{ls, logproto.Entry{
