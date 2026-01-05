@@ -84,7 +84,7 @@ var (
 	cloudfrontTimestampRegex = regexp.MustCompile(`(?P<timestamp>\d+-\d+-\d+\s\d+:\d+:\d+)`)
 	wafFilenameRegex         = regexp.MustCompile(`AWSLogs\/(?P<account_id>\d+)\/(?P<type>WAFLogs)\/(?P<region>[\w-]+)\/(?P<src>[\w-]+)\/(?P<year>\d+)\/(?P<month>\d+)\/(?P<day>\d+)\/(?P<hour>\d+)\/(?P<minute>\d+)\/\d+\_waflogs\_[\w-]+_[\w-]+_\d+T\d+Z_\w+`)
 	wafTimestampRegex        = regexp.MustCompile(`"timestamp":\s*(?P<timestamp>\d+),`)
-	s3AccessLogFilenameRegex = regexp.MustCompile(`(?:.*\/)?(?P<year>\d{4})-(?P<month>\d{2})-(?P<day>\d{2})-(?P<hour>\d{2})-(?P<minute>\d{2})-(?P<second>\d{2})-(?P<file_id>[A-Z0-9]+)$`)
+	s3AccessLogFilenameRegex = regexp.MustCompile(`(?:.*\/)?(?P<year>\d{4})-(?P<month>\d{2})-(?P<day>\d{2})-(?P<hour>\d{2})-(?P<minute>\d{2})-(?P<second>\d{2})-(?P<file_id>[A-F0-9]{16})$`)
 	s3AccessLogTimestampRegex = regexp.MustCompile(`\[(?P<timestamp>\d{2}\/[A-Za-z]{3}\/\d{4}:\d{2}:\d{2}:\d{2}\s[+\-]\d{4})\]`)
 	parsers                  = map[string]parserConfig{
 		FLOW_LOG_TYPE: {
