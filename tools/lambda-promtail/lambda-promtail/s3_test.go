@@ -640,7 +640,7 @@ func Test_parseS3Log(t *testing.T) {
 			name: "s3_access_logs",
 			args: args{
 				batchSize: 131072, // Set large enough we don't try and send to promtail
-				filename:  "", // We'll create the content inline since it's plain text
+				filename:  "../testdata/s3accesslog.txt",
 				b: &batch{
 					streams: map[string]*logproto.Stream{},
 				},
@@ -707,17 +707,10 @@ func Test_parseS3Log(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			var err error
 			batchSize = tt.args.batchSize
-			// Handle S3 access logs with inline test data (plain text, not a file)
-			if tt.name == "s3_access_logs" {
-				testLogLine := `8a2b8c083616eedb641d19d09a3df1c58140281be5de78bd378053da98598f92 mintel-core-frontend-app-shell-prod-replica [05/Dec/2025:23:49:46 +0000] 64.252.71.196 - RWXJ337PHNKAXKAJ WEBSITE.GET.OBJECT gnpd-data-entry/projects/gnpd/image-sets/a38f9766-2dee-4f2d-bc44-e0c5965ee79a "GET /gnpd-data-entry/projects/gnpd/image-sets/a38f9766-2dee-4f2d-bc44-e0c5965ee79a?productInfo=Batch+Entry+175699%3A5+%7C+Iwatsuka+Seika+The+Hitotsumami+Pizza+Margarita+Flavoured+Rice+Cracker HTTP/1.1" 404 NoSuchKey 625 - 48 - "-" "Amazon CloudFront" - 8htnihf1feY67Nx1Yr6bflyfkVxBFtZmdiJTvsOo3P/DTqfkA6jsaT5IYoKdyIGJeORE+LtJM74LOoNS0joL4c7qVyr+aEdM - - - mintel-core-frontend-app-shell-prod-replica.s3-website-us-west-2.amazonaws.com - - -`
-				tt.args.obj = io.NopCloser(bytes.NewReader([]byte(testLogLine)))
-			} else {
-				tt.args.obj, err = os.Open(tt.args.filename)
-				if err != nil {
-					t.Errorf("parseS3Log() failed to open test file: %s - %v", tt.args.filename, err)
-				}
+			tt.args.obj, err = os.Open(tt.args.filename)
+			if err != nil {
+				t.Errorf("parseS3Log() failed to open test file: %s - %v", tt.args.filename, err)
 			}
-
 			buf := &bytes.Buffer{}
 			log := log.NewLogfmtLogger(buf)
 			if err := parseS3Log(context.Background(), tt.args.b, tt.args.labels, tt.args.obj, &log); (err != nil) != tt.wantErr {
