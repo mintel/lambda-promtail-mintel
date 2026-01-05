@@ -163,29 +163,25 @@ func parseS3Log(ctx context.Context, b *batch, labels map[string]string, obj io.
 		return fmt.Errorf("could not find parser for type %s", labels["type"])
 	}
 
-	// Read first few bytes to check if it's gzipped
-	peekBytes := make([]byte, 2)
-	n, err := obj.Read(peekBytes)
+	defer obj.Close()
+	bReader := bufio.NewReader(obj)
+	peekBytes, err := bReader.Peek(2)
 	if err != nil && err != io.EOF {
 		return err
 	}
 	
 	var reader io.Reader
 	// Check if gzipped (magic bytes: 0x1F 0x8B)
-	if n >= 2 && peekBytes[0] == 0x1F && peekBytes[1] == 0x8B {
-		// Reset and create gzip reader
-		obj = io.NopCloser(io.MultiReader(bytes.NewReader(peekBytes[:n]), obj))
-		gzreader, err := gzip.NewReader(obj)
+	if len(peekBytes) >= 2 && peekBytes[0] == 0x1F && peekBytes[1] == 0x8B {
+		gzreader, err := gzip.NewReader(bReader)
 		if err != nil {
 			return err
 		}
 		defer gzreader.Close()
 		reader = gzreader
 	} else {
-		// Plain text - reset and use as-is
-		obj = io.NopCloser(io.MultiReader(bytes.NewReader(peekBytes[:n]), obj))
-		reader = obj
-		defer obj.Close()
+		// Plain text - use the buffered reader as-is
+		reader = bReader
 	}
 
 	scanner := bufio.NewScanner(reader)
