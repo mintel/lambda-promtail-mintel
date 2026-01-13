@@ -2,7 +2,6 @@ package main
 
 import (
 	"bufio"
-	"bytes"
 	"compress/gzip"
 	"context"
 	"encoding/json"
@@ -198,7 +197,9 @@ func parseS3Log(ctx context.Context, b *batch, labels map[string]string, obj io.
 	if labels["type"] == CLOUDTRAIL_LOG_TYPE {
 		records := make(chan Record)
 		jsonStream := NewJSONStream(records)
-		go jsonStream.Start(reader, parser.skipHeaderCount)
+		// CloudTrail logs are always gzipped, so reader is always a *gzip.Reader (io.ReadCloser)
+		readCloser := reader.(io.ReadCloser)
+		go jsonStream.Start(readCloser, parser.skipHeaderCount)
 		// Stream json file
 		for record := range jsonStream.records {
 			if record.Error != nil {
