@@ -50,6 +50,7 @@ const (
 	LB_NLB_TYPE                string = "net"
 	LB_ALB_TYPE                string = "app"
 	WAF_LOG_TYPE               string = "WAFLogs"
+	S3_ACCESS_LOG_TYPE         string = "s3accesslogs"
 )
 
 var (
@@ -82,6 +83,8 @@ var (
 	cloudfrontTimestampRegex = regexp.MustCompile(`(?P<timestamp>\d+-\d+-\d+\s\d+:\d+:\d+)`)
 	wafFilenameRegex         = regexp.MustCompile(`AWSLogs\/(?P<account_id>\d+)\/(?P<type>WAFLogs)\/(?P<region>[\w-]+)\/(?P<src>[\w-]+)\/(?P<year>\d+)\/(?P<month>\d+)\/(?P<day>\d+)\/(?P<hour>\d+)\/(?P<minute>\d+)\/\d+\_waflogs\_[\w-]+_[\w-]+_\d+T\d+Z_\w+`)
 	wafTimestampRegex        = regexp.MustCompile(`"timestamp":\s*(?P<timestamp>\d+),`)
+	s3AccessLogFilenameRegex = regexp.MustCompile(`(?:.*\/)?(?P<year>\d{4})-(?P<month>\d{2})-(?P<day>\d{2})-(?P<hour>\d{2})-(?P<minute>\d{2})-(?P<second>\d{2})-(?P<file_id>[A-F0-9]{16})$`)
+	s3AccessLogTimestampRegex = regexp.MustCompile(`\[(?P<timestamp>\d{2}\/[A-Za-z]{3}\/\d{4}:\d{2}:\d{2}:\d{2}\s[+\-]\d{4})\]`)
 	parsers                  = map[string]parserConfig{
 		FLOW_LOG_TYPE: {
 			logTypeLabel:    "s3_vpc_flow",
@@ -122,6 +125,15 @@ var (
 			timestampRegex: wafTimestampRegex,
 			timestampType:  "unix",
 		},
+		S3_ACCESS_LOG_TYPE: {
+			logTypeLabel:    "s3_access",
+			filenameRegex:   s3AccessLogFilenameRegex,
+			ownerLabelKey:   "bucket",
+			timestampRegex:  s3AccessLogTimestampRegex,
+			timestampFormat: "02/Jan/2006:15:04:05 -0700",  // S3 access log format: [02/Jan/2006:15:04:05 -0700]
+			timestampType:   "string",
+			skipHeaderCount: 0,  // S3 access logs typically don't have headers
+		},
 	}
 )
 
@@ -149,12 +161,29 @@ func parseS3Log(ctx context.Context, b *batch, labels map[string]string, obj io.
 		}
 		return fmt.Errorf("could not find parser for type %s", labels["type"])
 	}
-	gzreader, err := gzip.NewReader(obj)
-	if err != nil {
+
+	defer obj.Close()
+	bReader := bufio.NewReader(obj)
+	peekBytes, err := bReader.Peek(2)
+	if err != nil && err != io.EOF {
 		return err
 	}
+	
+	var reader io.Reader
+	// Check if gzipped (magic bytes: 0x1F 0x8B)
+	if len(peekBytes) >= 2 && peekBytes[0] == 0x1F && peekBytes[1] == 0x8B {
+		gzreader, err := gzip.NewReader(bReader)
+		if err != nil {
+			return err
+		}
+		defer gzreader.Close()
+		reader = gzreader
+	} else {
+		// Plain text - use the buffered reader as-is
+		reader = bReader
+	}
 
-	scanner := bufio.NewScanner(gzreader)
+	scanner := bufio.NewScanner(reader)
 
 	ls := model.LabelSet{
 		model.LabelName("__aws_log_type"):                                   model.LabelValue(parser.logTypeLabel),
@@ -168,7 +197,9 @@ func parseS3Log(ctx context.Context, b *batch, labels map[string]string, obj io.
 	if labels["type"] == CLOUDTRAIL_LOG_TYPE {
 		records := make(chan Record)
 		jsonStream := NewJSONStream(records)
-		go jsonStream.Start(gzreader, parser.skipHeaderCount)
+		// CloudTrail logs are always gzipped, so reader is always a *gzip.Reader (io.ReadCloser)
+		readCloser := reader.(io.ReadCloser)
+		go jsonStream.Start(readCloser, parser.skipHeaderCount)
 		// Stream json file
 		for record := range jsonStream.records {
 			if record.Error != nil {
